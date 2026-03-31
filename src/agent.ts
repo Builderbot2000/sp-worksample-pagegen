@@ -4,16 +4,11 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import { renderStream } from "./render";
+import { enrichContext } from "./context";
 
 const client = new Anthropic();
 
 const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
-
-async function fetchPage(url: string) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
-  return res.text();
-}
 
 export async function generatePage(url: string): Promise<string | null> {
   let savedPath: string | null = null;
@@ -43,13 +38,8 @@ export async function generatePage(url: string): Promise<string | null> {
     },
   });
 
-  const sourceHtml = await fetchPage(url);
-
-  const maxChars = 80_000;
-  const truncated =
-    sourceHtml.length > maxChars
-      ? sourceHtml.slice(0, maxChars) + "\n<!-- truncated -->"
-      : sourceHtml;
+  const { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies } =
+    await enrichContext(url);
 
   const runner = client.beta.messages.toolRunner({
     model: "claude-haiku-4-5",
@@ -62,22 +52,47 @@ export async function generatePage(url: string): Promise<string | null> {
     messages: [
       {
         role: "user",
-        content: `Create a single-file HTML page that recreates this page's content and visual design using Tailwind CSS (via CDN script tag). 
-        
+        content: [
+          ...screenshotChunks.map((data) => ({
+            type: "image" as const,
+            source: {
+              type: "base64" as const,
+              media_type: "image/png" as const,
+              data,
+            },
+          })),
+          {
+            type: "text",
+            text: `Create a single-file HTML page that recreates this page's content and visual design using Tailwind CSS (via CDN script tag).
+
 The page MUST:
 
 - Be a complete, self-contained HTML file
 - Use the Tailwind CSS CDN (<script src="https://cdn.tailwindcss.com"></script>)
-- Faithfully reproduce the layout, content, and visual style of the source page
+- Faithfully reproduce the layout, content, and visual style of the source page as shown in the viewport screenshots above (each image is a 1440×900px slice of the page from top to bottom)
 - Be responsive and well-structured
 
 Use descriptive kebab-case filename based on the source page's title or domain.
 
-Here is the HTML source of a webpage at ${url}:
+**Fonts**
+The following non-generic font families were detected on the source page. Import each one via a Google Fonts <link> tag in the <head> and apply them to the appropriate elements:
+${fontFamilies.length > 0 ? fontFamilies.map((f) => `- ${f}`).join("\n") : "- (none detected — use system fonts)"}
+
+**Computed styles** (use these to match colors, spacing, and typography exactly):
+\`\`\`json
+${JSON.stringify(computedStyles, null, 2)}
+\`\`\`
+
+**Image URLs** (use these exact absolute URLs as src attributes for <img> tags — do not use placeholder images):
+${absoluteImageUrls.length > 0 ? absoluteImageUrls.map((u) => `- ${u}`).join("\n") : "- (none detected)"}
+
+Here is the HTML source of the page at ${url}:
 
 <source_html>
-${truncated}
+${html}
 </source_html>`,
+          },
+        ],
       },
     ],
   });

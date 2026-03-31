@@ -33,7 +33,7 @@ Five coarse landmark regions are extracted from the source DOM via Puppeteer:
 | `cta` | `[class*='cta']`, `[class*='call-to-action']` |
 | `footer` | `footer` |
 
-Viewport is normalized to 1440px on both screenshots for stability. Segments are sorted top-to-bottom and clipped to prevent overlap before diffing.
+Viewport is normalized to 1440px on both screenshots for stability. Both the source and generated pages are captured as 1440×900px viewport-sized chunks (matching the context enrichment approach) rather than a single full-page screenshot, ensuring consistent scale and avoiding dimension limits. Segments are sorted top-to-bottom and clipped to prevent overlap before diffing.
 
 ### Scoring
 
