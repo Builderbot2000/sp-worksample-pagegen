@@ -52,8 +52,17 @@ const GENERIC_FONT_FAMILIES = new Set([
 ]);
 
 const MAX_HTML_CHARS = 80_000;
+const MAX_SECTION_HTML_CHARS = 40_000;
 
 export type ComputedStyles = Record<string, Record<string, string>>;
+
+export interface PageSection {
+  id: string;
+  html: string;
+  screenshotChunks: string[];
+  top: number;
+  height: number;
+}
 
 export interface EnrichedContext {
   html: string;
@@ -62,6 +71,117 @@ export interface EnrichedContext {
   absoluteImageUrls: string[];
   fontFamilies: string[];
   inlineSvgs: string[];
+  sections: PageSection[];
+}
+
+interface RawSection {
+  selector: string;
+  outerHTML: string;
+  top: number;
+  height: number;
+}
+
+async function extractPageSections(
+  page: Awaited<ReturnType<Awaited<ReturnType<typeof puppeteer.launch>>["newPage"]>>,
+): Promise<PageSection[]> {
+  await page.evaluate(() => window.scrollTo(0, 0));
+
+  const rawSections: RawSection[] = await page.evaluate(() => {
+    const MIN_HEIGHT = 80;
+    const MAX_SECTIONS = 20;
+    const results: { selector: string; outerHTML: string; top: number; height: number }[] = [];
+
+    // Header
+    const header = document.querySelector("header");
+    if (header) {
+      const rect = header.getBoundingClientRect();
+      const top = rect.top + window.scrollY;
+      const height = (header as HTMLElement).scrollHeight || rect.height;
+      if (height >= MIN_HEIGHT) results.push({ selector: "header", outerHTML: header.outerHTML, top, height });
+    }
+
+    // Nav only if not inside header
+    const nav = document.querySelector("nav");
+    if (nav && !header?.contains(nav)) {
+      const rect = nav.getBoundingClientRect();
+      const top = rect.top + window.scrollY;
+      const height = (nav as HTMLElement).scrollHeight || rect.height;
+      if (height >= MIN_HEIGHT) results.push({ selector: "nav", outerHTML: nav.outerHTML, top, height });
+    }
+
+    // Main children, or fallback top-level landmark elements
+    const main = document.querySelector("main");
+    if (main) {
+      let added = 0;
+      for (const child of Array.from(main.children)) {
+        if (added >= MAX_SECTIONS) break;
+        const rect = child.getBoundingClientRect();
+        const height = (child as HTMLElement).scrollHeight || rect.height;
+        if (height >= MIN_HEIGHT) {
+          const top = rect.top + window.scrollY;
+          results.push({ selector: "main > *", outerHTML: child.outerHTML, top, height });
+          added++;
+        }
+      }
+    } else {
+      const candidates = Array.from(
+        document.querySelectorAll("body > section, body > article, body > div[class]"),
+      );
+      const filtered = candidates.filter(
+        (el) => !candidates.some((other) => other !== el && other.contains(el)),
+      );
+      for (const el of filtered.slice(0, MAX_SECTIONS)) {
+        const rect = el.getBoundingClientRect();
+        const top = rect.top + window.scrollY;
+        const height = (el as HTMLElement).scrollHeight || rect.height;
+        if (height >= MIN_HEIGHT) results.push({ selector: "body > *", outerHTML: el.outerHTML, top, height });
+      }
+    }
+
+    // Footer
+    const footer = document.querySelector("footer");
+    if (footer) {
+      const rect = footer.getBoundingClientRect();
+      const top = rect.top + window.scrollY;
+      const height = (footer as HTMLElement).scrollHeight || rect.height;
+      if (height >= MIN_HEIGHT) results.push({ selector: "footer", outerHTML: footer.outerHTML, top, height });
+    }
+
+    results.sort((a, b) => a.top - b.top);
+    return results;
+  });
+
+  if (rawSections.length < 2) return [];
+
+  const sections: PageSection[] = [];
+  for (let i = 0; i < rawSections.length; i++) {
+    const raw = rawSections[i];
+    const id = `section-${i + 1}`;
+    const html =
+      raw.outerHTML.length > MAX_SECTION_HTML_CHARS
+        ? raw.outerHTML.slice(0, MAX_SECTION_HTML_CHARS) + "<!-- truncated -->"
+        : raw.outerHTML;
+
+    // Screenshot up to 3 chunks of 900px each, using page coordinates (no scroll needed)
+    const MAX_SECTION_CHUNKS = 3;
+    const chunkH = 900;
+    const numChunks = Math.min(MAX_SECTION_CHUNKS, Math.ceil(raw.height / chunkH));
+    const screenshotChunks: string[] = [];
+    for (let c = 0; c < numChunks; c++) {
+      const yOffset = Math.round(raw.top) + c * chunkH;
+      const chunkHeight = Math.min(chunkH, Math.round(raw.top + raw.height) - yOffset);
+      if (chunkHeight <= 0) break;
+      const chunk = await page.screenshot({
+        encoding: "base64",
+        clip: { x: 0, y: yOffset, width: 1440, height: chunkHeight },
+      });
+      screenshotChunks.push(chunk);
+    }
+
+    sections.push({ id, html, screenshotChunks, top: raw.top, height: raw.height });
+  }
+
+  return sections;
 }
 
 export async function enrichContext(url: string): Promise<EnrichedContext> {
@@ -156,7 +276,10 @@ export async function enrichContext(url: string): Promise<EnrichedContext> {
     // Derive font families from computed styles
     const fontFamilies = deriveFontFamilies(computedStyles);
 
-    return { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies, inlineSvgs };
+    // Semantic section segmentation
+    const sections = await extractPageSections(page);
+
+    return { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies, inlineSvgs, sections };
   } finally {
     await browser.close();
   }

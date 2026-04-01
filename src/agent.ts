@@ -5,6 +5,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { renderStream, printIterationHeader, printPageScore, printFinalSummary } from "./render";
 import { enrichContext } from "./context";
+import type { PageSection } from "./context";
+import type { ComputedStyles } from "./context";
 import { screenshotPage } from "./screenshot";
 import { scorePage } from "./diff/score";
 import { captionPage } from "./diff/caption";
@@ -31,6 +33,175 @@ function urlSlug(url: string): string {
     .replace(/[^a-z0-9]+/gi, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 60);
+}
+
+function buildSaveSectionTool(sectionId: string) {
+  let savedContent: string | null = null;
+
+  const tool = betaZodTool({
+    name: "save_section",
+    description:
+      "Save a generated HTML section fragment. The content must NOT include <html>, <head>, or <body> tags — only the inner fragment markup for this section.",
+    inputSchema: z.object({
+      content: z.string().describe("The HTML fragment for this section only. No <html>/<head>/<body> tags."),
+    }),
+    run: async (input) => {
+      savedContent = input.content;
+      return JSON.stringify({ success: true, section_id: sectionId });
+    },
+  });
+
+  return { tool, getContent: () => savedContent };
+}
+
+function buildPageShell(fontFamilies: string[], computedStyles: ComputedStyles): string {
+  const bodyBg = computedStyles["body"]?.["background-color"] ?? "rgb(255, 255, 255)";
+  const bodyColor = computedStyles["body"]?.["color"] ?? "rgb(0, 0, 0)";
+  const fontLinks = fontFamilies
+    .map((f) => {
+      const encoded = encodeURIComponent(f);
+      return `  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=${encoded}:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800&display=swap">`;
+    })
+    .join("\n");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.tailwindcss.com"></script>
+${fontLinks}
+  <style>
+    body { background-color: ${bodyBg}; color: ${bodyColor}; }
+  </style>
+</head>
+<body>`;
+}
+
+function buildSectionPrompt(opts: {
+  section: PageSection;
+  sectionIndex: number;
+  totalSections: number;
+  computedStyles: ComputedStyles;
+  fontFamilies: string[];
+  absoluteImageUrls: string[];
+  inlineSvgs: string[];
+  prevTail: string | null;
+}): string {
+  const { section, sectionIndex, totalSections, computedStyles, fontFamilies, absoluteImageUrls, inlineSvgs, prevTail } = opts;
+  return `You are generating section ${sectionIndex + 1} of ${totalSections} of a page reconstruction.
+
+CRITICAL: Output ONLY an HTML fragment for this section. Do NOT include <html>, <head>, <body>, or any Tailwind CDN script tags — those are already in the surrounding shell.
+
+The section screenshots above show exactly what this section looks like (1440×900px slices from top to bottom of the section).
+
+**Fonts in use across this page:**
+${fontFamilies.length > 0 ? fontFamilies.map((f) => `- ${f}`).join("\n") : "- (none — use system fonts)"}
+Apply font sizes from computed styles using Tailwind arbitrary values (e.g., \`text-[16px]\`). Do NOT use generic size classes (text-sm, text-base, etc.) when an exact px value is available.
+
+**Layout**
+Reproduce the columnar and grid structure exactly as shown in screenshots and computed styles. Use Tailwind arbitrary grid classes (e.g., \`grid grid-cols-[repeat(3,1fr)]\`) when needed. Do NOT collapse multi-column layouts.
+
+**Computed styles** (use for colors, spacing, typography):
+\`\`\`json
+${JSON.stringify(computedStyles, null, 2)}
+\`\`\`
+
+**Image URLs** (use exact absolute URLs):
+${absoluteImageUrls.length > 0 ? absoluteImageUrls.map((u) => `- ${u}`).join("\n") : "- (none)"}
+
+**SVG assets** — copy verbatim, do NOT redraw:
+${inlineSvgs.length > 0 ? inlineSvgs.map((svg, i) => `<!-- SVG ${i + 1} -->\n${svg}`).join("\n\n") : "- (none)"}
+
+**Source HTML for this section:**
+<section_html>
+${section.html}
+</section_html>
+${prevTail ? `\n**Preceding section tail** (match spacing/colors at the boundary — do NOT repeat this markup):\n<preceding_section_tail>\n${prevTail}\n</preceding_section_tail>` : ""}
+
+Call save_section with your HTML fragment now.`;
+}
+
+async function generatePageInSections(
+  client: Anthropic,
+  opts: {
+    url: string;
+    sections: PageSection[];
+    computedStyles: ComputedStyles;
+    fontFamilies: string[];
+    absoluteImageUrls: string[];
+    inlineSvgs: string[];
+    outDir: string;
+  },
+): Promise<{ savedPath: string | null; tokensIn: number; tokensOut: number; filename: string | null }> {
+  const { url, sections, computedStyles, fontFamilies, absoluteImageUrls, inlineSvgs, outDir } = opts;
+  let tokensIn = 0;
+  let tokensOut = 0;
+  const sectionContents: string[] = [];
+
+  for (let i = 0; i < sections.length; i++) {
+    const section = sections[i];
+    process.stdout.write(`\n⚙️  Generating section ${i + 1}/${sections.length}: ${section.id}\n`);
+
+    const prevTail = i > 0 && sectionContents[i - 1]
+      ? sectionContents[i - 1].slice(-2000)
+      : null;
+
+    const { tool, getContent } = buildSaveSectionTool(section.id);
+
+    const sectionRunner = client.beta.messages.toolRunner({
+      model: "claude-sonnet-4-6",
+      max_tokens: 16000,
+      tools: [tool],
+      tool_choice: { type: "tool", name: "save_section" },
+      stream: true,
+      max_iterations: 1,
+      system: `You are a helpful assistant that generates HTML section fragments from source HTML. You produce only the fragment — no document shell.`,
+      messages: [
+        {
+          role: "user",
+          content: [
+            ...section.screenshotChunks.map((data) => ({
+              type: "image" as const,
+              source: {
+                type: "base64" as const,
+                media_type: "image/png" as const,
+                data,
+              },
+            })),
+            {
+              type: "text",
+              text: buildSectionPrompt({ section, sectionIndex: i, totalSections: sections.length, computedStyles, fontFamilies, absoluteImageUrls, inlineSvgs, prevTail }),
+            },
+          ],
+        },
+      ],
+    });
+
+    await renderStream(sectionRunner);
+
+    try {
+      const msg = await sectionRunner.done();
+      tokensIn += msg.usage.input_tokens;
+      tokensOut += msg.usage.output_tokens;
+    } catch {
+      // Not fatal
+    }
+
+    const content = getContent();
+    sectionContents.push(content ?? "<!-- section generation failed -->");
+  }
+
+  const shell = buildPageShell(fontFamilies, computedStyles);
+  const assembled = shell + "\n" + sectionContents.join("\n") + "\n</body>\n</html>";
+
+  fs.mkdirSync(outDir, { recursive: true });
+  const filename = urlSlug(url) + ".html";
+  const savedPath = path.join(outDir, filename);
+  fs.writeFileSync(savedPath, assembled, "utf-8");
+  process.stdout.write(`\n✅ Assembled ${sections.length} sections → ${savedPath}\n`);
+
+  return { savedPath, tokensIn, tokensOut, filename };
 }
 
 function buildSaveFileTool(outputDir: string) {
@@ -109,7 +280,7 @@ export async function generatePage(
   process.stdout.write("\n⏳ Enriching context and capturing source screenshot...\n");
 
   const [
-    { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies, inlineSvgs },
+    { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies, inlineSvgs, sections },
     sourceScreenshotResult,
   ] = await Promise.all([
     enrichContext(url).then((ctx) => {
@@ -147,32 +318,65 @@ export async function generatePage(
     : null;
 
   // ── Initial generation ─────────────────────────────────────────────────────
-  const { tool: saveFile, getSavedPath } = buildSaveFileTool(path.join(runDir, "main"));
-
+  const mainOutDir = path.join(runDir, "main");
   const genStart = Date.now();
-  const runner = client.beta.messages.toolRunner({
-    model: "claude-sonnet-4-6",
-    max_tokens: 32000,
-    tools: [saveFile],
-    tool_choice: { type: "tool", name: "save_file" },
-    stream: true,
-    max_iterations: 1,
-    system: `You are a helpful assistant that generates HTML pages from source HTML.`,
-    messages: [
-      {
-        role: "user",
-        content: [
-          ...screenshotChunks.map((data) => ({
-            type: "image" as const,
-            source: {
-              type: "base64" as const,
-              media_type: "image/png" as const,
-              data,
-            },
-          })),
-          {
-            type: "text",
-            text: `Create a single-file HTML page that recreates this page's content and visual design using Tailwind CSS (via CDN script tag).
+  let savedPath: string | null = null;
+  let genFilename: string | null = null;
+
+  if (sections.length >= 2) {
+    // Multi-section path: generate each semantic section independently then assemble
+    process.stdout.write(`\n📐 Segmented generation: ${sections.length} sections detected\n`);
+    const result = await generatePageInSections(client, {
+      url,
+      sections,
+      computedStyles,
+      fontFamilies,
+      absoluteImageUrls,
+      inlineSvgs,
+      outDir: mainOutDir,
+    });
+    savedPath = result.savedPath;
+    genFilename = result.filename;
+    totalTokensIn += result.tokensIn;
+    totalTokensOut += result.tokensOut;
+    logger.log({
+      phase: "generate",
+      timestamp: Date.now(),
+      data: {
+        model: "claude-sonnet-4-6",
+        tokensIn: result.tokensIn,
+        tokensOut: result.tokensOut,
+        durationMs: Date.now() - genStart,
+        outputFile: savedPath ?? "",
+      },
+    });
+  } else {
+    // Single-shot path (short pages or pages where segmentation found < 2 sections)
+    const { tool: saveFile, getSavedPath } = buildSaveFileTool(mainOutDir);
+
+    const runner = client.beta.messages.toolRunner({
+      model: "claude-sonnet-4-6",
+      max_tokens: 32000,
+      tools: [saveFile],
+      tool_choice: { type: "tool", name: "save_file" },
+      stream: true,
+      max_iterations: 1,
+      system: `You are a helpful assistant that generates HTML pages from source HTML.`,
+      messages: [
+        {
+          role: "user",
+          content: [
+            ...screenshotChunks.map((data) => ({
+              type: "image" as const,
+              source: {
+                type: "base64" as const,
+                media_type: "image/png" as const,
+                data,
+              },
+            })),
+            {
+              type: "text",
+              text: `Create a single-file HTML page that recreates this page's content and visual design using Tailwind CSS (via CDN script tag).
 
 The page MUST:
 
@@ -211,45 +415,49 @@ Here is the HTML source of the page at ${url}:
 <source_html>
 ${html}
 </source_html>`,
-          },
-        ],
-      },
-    ],
-  });
+            },
+          ],
+        },
+      ],
+    });
 
-  await renderStream(runner);
+    await renderStream(runner);
+
+    savedPath = getSavedPath();
+    genFilename = savedPath ? path.basename(savedPath) : null;
+
+    try {
+      const finalMsg = await runner.done();
+      totalTokensIn += finalMsg.usage.input_tokens;
+      totalTokensOut += finalMsg.usage.output_tokens;
+      logger.log({
+        phase: "generate",
+        timestamp: Date.now(),
+        data: {
+          model: "claude-sonnet-4-6",
+          tokensIn: finalMsg.usage.input_tokens,
+          tokensOut: finalMsg.usage.output_tokens,
+          durationMs: Date.now() - genStart,
+          outputFile: savedPath ?? "",
+        },
+      });
+    } catch {
+      // Not fatal — proceed without token tracking for this pass
+    }
+  }
+
   const genEnd = Date.now();
+  void genEnd; // used only for logging above
 
-  const savedPath = getSavedPath();
   if (!savedPath) {
     process.stderr.write("Generation failed: no file was saved.\n");
     return null;
   }
 
-  // Estimate tokens from final message usage (best effort)
-  try {
-    const finalMsg = await runner.done();
-    totalTokensIn += finalMsg.usage.input_tokens;
-    totalTokensOut += finalMsg.usage.output_tokens;
-    logger.log({
-      phase: "generate",
-      timestamp: Date.now(),
-      data: {
-        model: "claude-sonnet-4-6",
-        tokensIn: finalMsg.usage.input_tokens,
-        tokensOut: finalMsg.usage.output_tokens,
-        durationMs: genEnd - genStart,
-        outputFile: savedPath,
-      },
-    });
-  } catch {
-    // Not fatal — proceed without token tracking for this pass
-  }
-
   // ── Iterative fix loop ─────────────────────────────────────────────────────
   let prevScore = 0;
   const overallScores: number[] = [];
-  const filename = path.basename(savedPath);
+  const filename = genFilename ?? path.basename(savedPath);
 
   for (let iter = 0; iter < opts.maxIterations; iter++) {
     printIterationHeader(iter + 1, opts.maxIterations);
