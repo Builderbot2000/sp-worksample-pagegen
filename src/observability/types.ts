@@ -26,9 +26,8 @@ export interface ScreenshotData {
 
 export interface DiffData {
   iteration: number;
-  overallScore: number;
-  diffPixels: number;
-  totalPixels: number;
+  vlmScore: number;
+  vlmVerdict: VlmVerdict;
 }
 
 export interface CaptionData {
@@ -61,10 +60,9 @@ export type LogLine =
 
 export interface IterationRecord {
   iteration: number;
-  overallScore: number;
+  vlmScore: number;
+  vlmVerdict: VlmVerdict;
   severity: Severity;
-  diffPixels: number;
-  totalPixels: number;
   discrepancyCount: number;
 }
 
@@ -79,6 +77,49 @@ export interface BaselineComparison {
   mainThumbnail: string;
 }
 
+// ─── Fidelity metrics ────────────────────────────────────────────────────────
+
+export interface DomInfo {
+  headings: Array<{ tag: string; text: string }>;
+  paragraphs: number;
+  images: number;
+  buttons: number;
+  sections: number;
+  links: number;
+  totalTextLength: number;
+}
+
+export type VlmVerdict = "close" | "partial" | "distant";
+
+export interface VlmFidelityScore {
+  verdict: VlmVerdict;
+  score: number;
+  sections: Record<string, "match" | "partial" | "missing">;
+  issues: string[];
+}
+
+export interface DomDiffResult {
+  missingHeadings: string[];
+  extraHeadings: string[];
+  imageDelta: number;
+  buttonDelta: number;
+  sectionDelta: number;
+  textCoverageRatio: number;
+  score: number;
+}
+
+export interface FidelityMetrics {
+  sourceScreenshotBase64: string;
+  mainScreenshotBase64: string;
+  baselineScreenshotBase64?: string;
+  mainVlmScore: VlmFidelityScore;
+  baselineVlmScore?: VlmFidelityScore;
+  mainDomDiff: DomDiffResult;
+  baselineDomDiff?: DomDiffResult;
+}
+
+// ─── Run record ───────────────────────────────────────────────────────────────
+
 export interface RunRecord {
   runId: string;
   name?: string;
@@ -88,4 +129,5 @@ export interface RunRecord {
   iterations: IterationRecord[];
   estimatedCostUsd: number;
   baseline?: BaselineComparison;
+  fidelityMetrics?: FidelityMetrics;
 }

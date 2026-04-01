@@ -7,6 +7,7 @@ import { renderStream } from "./render";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
 import { estimateCost } from "./observability/metrics";
+import { collectFidelityMetrics } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
 import type { RunRecord } from "./observability/types";
 
@@ -220,10 +221,13 @@ ${truncated}
     estimatedCostUsd,
   };
 
+  let baselineSavedPath: string | null = null;
+
   if (opts.baseline) {
     const baselineDir = path.join(runDir, "baseline");
     console.log("\n[baseline] Running baseline agent...");
     const bl = await runBaseline(url, baselineDir, truncated);
+    baselineSavedPath = bl.savedPath;
     record.baseline = {
       baselineScore: 0,
       baselineCostUsd: estimateCost(BASELINE_MODEL, bl.tokensIn, bl.tokensOut),
@@ -237,8 +241,36 @@ ${truncated}
     console.log(`[baseline] Saved to ${bl.savedPath}`);
   }
 
+  if (savedPath) {
+    console.log("\n[fidelity] Computing fidelity metrics...");
+    try {
+      const fidelity = await collectFidelityMetrics(
+        url,
+        savedPath,
+        baselineSavedPath ?? undefined,
+      );
+      record.fidelityMetrics = fidelity;
+      if (record.baseline) {
+        record.baseline.mainScore = fidelity.mainVlmScore.score;
+        record.baseline.mainThumbnail = fidelity.mainScreenshotBase64;
+        if (fidelity.baselineVlmScore) {
+          record.baseline.baselineScore = fidelity.baselineVlmScore.score;
+        }
+        if (fidelity.baselineScreenshotBase64) {
+          record.baseline.baselineThumbnail = fidelity.baselineScreenshotBase64;
+        }
+      }
+    } catch (err) {
+      console.error("[fidelity] Failed to collect fidelity metrics:", err);
+    }
+  }
+
   logger.finalize(record);
-  generateReport(runDir, record);
+  generateReport(
+    runDir,
+    record,
+    record.fidelityMetrics?.sourceScreenshotBase64,
+  );
 
   return savedPath;
 }
