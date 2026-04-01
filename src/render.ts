@@ -1,9 +1,12 @@
 import type { BetaToolRunner } from "@anthropic-ai/sdk/lib/tools/BetaToolRunner";
+import type { PageScore } from "./diff/score";
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
+const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
+const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
 
 export async function renderStream(runner: BetaToolRunner<true>) {
   let currentBlockType: string | null = null;
@@ -63,4 +66,40 @@ export async function renderStream(runner: BetaToolRunner<true>) {
 
     process.stdout.write("\n");
   }
+}
+
+export function printIterationHeader(n: number, max: number): void {
+  process.stdout.write(`\n${bold(cyan(`🔄 Fix iteration ${n}/${max}`))}\n`);
+}
+
+export function printPageScore(score: PageScore): void {
+  const col =
+    score.severity === "high"
+      ? red
+      : score.severity === "medium"
+        ? yellow
+        : green;
+  process.stdout.write(
+    `\n  Fidelity: ${col(score.score.toFixed(3))} ${dim(`(${score.severity})`)}  ${dim(`${score.diffPixels.toLocaleString()} px differ`)}\n`,
+  );
+}
+
+export function printFinalSummary(overallScores: number[]): void {
+  if (overallScores.length === 0) return;
+
+  const SPARKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+  const max = Math.max(...overallScores);
+  const min = Math.min(...overallScores);
+  const range = max - min || 1;
+  const spark = overallScores
+    .map((s) => {
+      const idx = Math.round(((s - min) / range) * (SPARKS.length - 1));
+      return SPARKS[idx];
+    })
+    .join("");
+
+  const final = overallScores[overallScores.length - 1];
+  process.stdout.write(
+    `\n${bold("Fidelity:")} ${spark}  final score ${bold(green(final.toFixed(3)))}\n`,
+  );
 }

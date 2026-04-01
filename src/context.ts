@@ -4,9 +4,15 @@ const STYLE_SELECTORS = [
   "body",
   "h1",
   "h2",
+  "h3",
+  "h4",
+  "p",
   "nav",
   "header",
   "footer",
+  "main",
+  "section",
+  "article",
   "button",
   "a",
 ] as const;
@@ -16,10 +22,17 @@ const STYLE_PROPERTIES = [
   "background-color",
   "font-family",
   "font-size",
+  "font-weight",
   "padding",
   "margin",
   "line-height",
   "letter-spacing",
+  "display",
+  "grid-template-columns",
+  "flex-direction",
+  "flex-wrap",
+  "gap",
+  "max-width",
 ] as const;
 
 const GENERIC_FONT_FAMILIES = new Set([
