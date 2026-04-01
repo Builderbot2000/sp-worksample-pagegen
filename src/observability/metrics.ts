@@ -1,15 +1,19 @@
-// Sonnet 4-6 pricing (USD per million tokens)
-const SONNET_INPUT_COST_PER_M = 3.0;
-const SONNET_OUTPUT_COST_PER_M = 15.0;
+// Pricing (USD per million tokens)
+const PRICING: Record<string, { input: number; output: number }> = {
+  "claude-sonnet-4-6": { input: 3.0, output: 15.0 },
+  "claude-haiku-4-5": { input: 0.8, output: 4.0 },
+};
+const DEFAULT_PRICING = PRICING["claude-sonnet-4-6"];
 
 export function estimateCost(
-  _model: string,
+  model: string,
   tokensIn: number,
   tokensOut: number,
 ): number {
+  const p = PRICING[model] ?? DEFAULT_PRICING;
   return (
-    (tokensIn / 1_000_000) * SONNET_INPUT_COST_PER_M +
-    (tokensOut / 1_000_000) * SONNET_OUTPUT_COST_PER_M
+    (tokensIn / 1_000_000) * p.input +
+    (tokensOut / 1_000_000) * p.output
   );
 }
 

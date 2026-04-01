@@ -55,6 +55,19 @@ export type LogLine =
   | { phase: "caption"; timestamp: number; data: CaptionData }
   | { phase: "fix"; timestamp: number; data: FixData };
 
+// ─── Baseline comparison ──────────────────────────────────────────────────────
+
+export interface BaselineComparison {
+  baselineScore: number;
+  baselineCostUsd: number;
+  baselineDurationMs: number;
+  baselineThumbnail: string; // base64 PNG
+  mainScore: number;
+  mainCostUsd: number;
+  mainDurationMs: number;
+  mainThumbnail: string; // base64 PNG
+}
+
 // ─── Run-level structures ─────────────────────────────────────────────────────
 
 export interface IterationRecord {
@@ -72,7 +85,6 @@ export interface RunRecord {
   startedAt: number;
   completedAt: number;
   iterations: IterationRecord[];
-  totalTokensIn: number;
-  totalTokensOut: number;
   estimatedCostUsd: number;
+  baseline?: BaselineComparison;
 }

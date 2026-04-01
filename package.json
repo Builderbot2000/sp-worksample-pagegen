@@ -4,6 +4,7 @@
   "main": "src/cli.ts",
   "scripts": {
     "generate": "tsx src/cli.ts",
+    "baseline_generate": "tsx baseline/cli.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "check": "tsc --noEmit"

@@ -11,7 +11,9 @@ import { captionPage } from "./diff/caption";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
 import { estimateCost, checkConvergence } from "./observability/metrics";
-import type { IterationRecord, RunRecord } from "./observability/types";
+import { generateReport } from "./observability/report";
+import { runBaseline } from "./baseline-runner";
+import type { IterationRecord, RunRecord, BaselineComparison } from "./observability/types";
 
 const client = new Anthropic();
 
@@ -20,6 +22,7 @@ const OUTPUT_ROOT = path.resolve(__dirname, "..", "output");
 export interface GenerateOptions {
   maxIterations: number;
   threshold: number;
+  baseline: boolean;
 }
 
 function urlSlug(url: string): string {
@@ -80,10 +83,16 @@ function buildFixFileTool(outputDir: string, existingFilename: string) {
   });
 }
 
+export interface GenerateResult {
+  savedPath: string;
+  reportPath: string;
+  baselineSavedPath?: string;
+}
+
 export async function generatePage(
   url: string,
   opts: GenerateOptions,
-): Promise<string | null> {
+): Promise<GenerateResult | null> {
   const runId = `${Date.now()}-${urlSlug(url)}`;
   const runDir = path.join(OUTPUT_ROOT, runId);
   fs.mkdirSync(runDir, { recursive: true });
@@ -98,6 +107,14 @@ export async function generatePage(
 
   // ── Parallelize upfront context work ───────────────────────────────────────
   process.stdout.write("\n⏳ Enriching context and capturing source screenshot...\n");
+
+  const baselinePromise = opts.baseline
+    ? runBaseline(url, path.join(runDir, "baseline")).then((r) => {
+        process.stdout.write("✅ Baseline generation complete\n");
+        return r;
+      })
+    : null;
+
   const [
     { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies },
     sourceScreenshotResult,
@@ -129,7 +146,7 @@ export async function generatePage(
   ]);
 
   // ── Initial generation ─────────────────────────────────────────────────────
-  const { tool: saveFile, getSavedPath } = buildSaveFileTool(runDir);
+  const { tool: saveFile, getSavedPath } = buildSaveFileTool(path.join(runDir, "main"));
 
   const genStart = Date.now();
   const runner = client.beta.messages.toolRunner({
@@ -332,7 +349,7 @@ ${html}
     // Fix prompt
     const currentHtml = fs.readFileSync(savedPath, "utf-8");
     const fixStart = Date.now();
-    const fixTool = buildFixFileTool(runDir, filename);
+    const fixTool = buildFixFileTool(path.join(runDir, "main"), filename);
 
     const fixRunner = client.beta.messages.toolRunner({
       model: "claude-sonnet-4-6",
@@ -400,22 +417,55 @@ ${currentHtml}
   // Final summary
   printFinalSummary(overallScores);
 
+  const mainDurationMs = Date.now() - startedAt;
+  const mainCostUsd = estimateCost("claude-sonnet-4-6", totalTokensIn, totalTokensOut);
+
+  // ── Baseline comparison (if requested) ──────────────────────────────────────
+  let baseline: BaselineComparison | undefined;
+  let baselineSavedPath: string | undefined;
+
+  if (baselinePromise && savedPath) {
+    const baselineResult = await baselinePromise;
+
+    if (baselineResult.outputPath) {
+      baselineSavedPath = baselineResult.outputPath;
+      // Screenshot both final outputs and score against source
+      const [mainScreenshot, baselineScreenshot] = await Promise.all([
+        screenshotPage(`file://${savedPath}`),
+        screenshotPage(`file://${baselineResult.outputPath}`),
+      ]);
+
+      const mainScore = scorePage(sourceScreenshotResult.buffer, mainScreenshot.buffer);
+      const baselineScore = scorePage(sourceScreenshotResult.buffer, baselineScreenshot.buffer);
+
+      baseline = {
+        baselineScore: baselineScore.score,
+        baselineCostUsd: baselineResult.costUsd,
+        baselineDurationMs: baselineResult.durationMs,
+        baselineThumbnail: baselineScreenshot.buffer.toString("base64"),
+        mainScore: mainScore.score,
+        mainCostUsd: mainCostUsd,
+        mainDurationMs: mainDurationMs,
+        mainThumbnail: mainScreenshot.buffer.toString("base64"),
+      };
+
+      process.stdout.write(
+        `\n📊 Baseline comparison: main ${mainScore.score.toFixed(3)} vs baseline ${baselineScore.score.toFixed(3)}\n`,
+      );
+    }
+  }
+
   const runRecord: RunRecord = {
     runId,
     url,
     startedAt,
     completedAt: Date.now(),
     iterations: iterationRecords,
-    totalTokensIn,
-    totalTokensOut,
-    estimatedCostUsd: estimateCost(
-      "claude-sonnet-4-6",
-      totalTokensIn,
-      totalTokensOut,
-    ),
+    estimatedCostUsd: mainCostUsd,
+    baseline,
   };
 
   logger.finalize(runRecord);
-
-  return savedPath;
+  const reportPath = generateReport(runDir, runRecord, sourceScreenshotResult.buffer);
+  return { savedPath, reportPath, baselineSavedPath };
 }

@@ -19,11 +19,27 @@ Requires `ANTHROPIC_API_KEY` in your environment.
 ## Usage
 
 ```sh
-npm run generate -- <url>          # generate a page
-npm run generate -- <url> --open   # generate and open in browser
+npm run generate -- <url>                  # generate a page
+npm run generate -- <url> --iterations 6   # set max fix iterations (default: 4)
+npm run generate -- <url> --threshold 0.01 # convergence delta threshold (default: 0.02)
+npm run generate -- <url> --baseline       # run baseline agent in parallel and compare
 ```
 
-Output goes to `output/`.
+The `--baseline` flag runs the baseline agent (Haiku 4-5, single-pass) alongside the main agent (Sonnet 4-6, iterative) and produces a side-by-side comparison in the report.
+
+**Example:**
+
+```sh
+npm run generate -- https://stripe.com/payments --iterations 4 --threshold 0.02 --baseline
+```
+
+Output goes to `output/<run-id>/` and includes:
+
+- `run.json` — structured run record (tokens, cost, iterations, scores)
+- `run.ndjson` — append-only event log
+- `report.html` — self-contained HTML dashboard; auto-opens after every run
+- `main/<page>.html` — main generated HTML; auto-opens after every run
+- `baseline/<page>.html` — baseline HTML (when `--baseline` is used); auto-opens
 
 ## Development
 
