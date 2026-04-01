@@ -61,6 +61,7 @@ export interface EnrichedContext {
   computedStyles: ComputedStyles;
   absoluteImageUrls: string[];
   fontFamilies: string[];
+  inlineSvgs: string[];
 }
 
 export async function enrichContext(url: string): Promise<EnrichedContext> {
@@ -131,10 +132,31 @@ export async function enrichContext(url: string): Promise<EnrichedContext> {
       return urls;
     });
 
+    // Inline SVGs — top-level only (not nested inside another SVG), capped at 20 KB each
+    const MAX_SVG_BYTES = 20_000;
+    const MAX_SVG_COUNT = 15;
+    const inlineSvgs: string[] = await page.evaluate(
+      (maxBytes: number, maxCount: number) => {
+        // 'body svg:not(svg svg)' selects SVG elements that are NOT descendants of another SVG
+        const svgEls = Array.from(
+          document.querySelectorAll("body svg:not(svg svg)"),
+        ) as SVGElement[];
+        const results: string[] = [];
+        for (const el of svgEls) {
+          if (results.length >= maxCount) break;
+          const markup = el.outerHTML;
+          if (markup.length <= maxBytes) results.push(markup);
+        }
+        return results;
+      },
+      MAX_SVG_BYTES,
+      MAX_SVG_COUNT,
+    );
+
     // Derive font families from computed styles
     const fontFamilies = deriveFontFamilies(computedStyles);
 
-    return { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies };
+    return { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies, inlineSvgs };
   } finally {
     await browser.close();
   }

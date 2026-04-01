@@ -108,15 +108,8 @@ export async function generatePage(
   // ── Parallelize upfront context work ───────────────────────────────────────
   process.stdout.write("\n⏳ Enriching context and capturing source screenshot...\n");
 
-  const baselinePromise = opts.baseline
-    ? runBaseline(url, path.join(runDir, "baseline")).then((r) => {
-        process.stdout.write("✅ Baseline generation complete\n");
-        return r;
-      })
-    : null;
-
   const [
-    { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies },
+    { html, screenshotChunks, computedStyles, absoluteImageUrls, fontFamilies, inlineSvgs },
     sourceScreenshotResult,
   ] = await Promise.all([
     enrichContext(url).then((ctx) => {
@@ -144,6 +137,14 @@ export async function generatePage(
       return r;
     }),
   ]);
+
+  // ── Start baseline after context is fetched (avoids URL/rate-limit contention) ──
+  const baselinePromise = opts.baseline
+    ? runBaseline(url, path.join(runDir, "baseline")).then((r) => {
+        process.stdout.write("✅ Baseline generation complete\n");
+        return r;
+      })
+    : null;
 
   // ── Initial generation ─────────────────────────────────────────────────────
   const { tool: saveFile, getSavedPath } = buildSaveFileTool(path.join(runDir, "main"));
@@ -197,6 +198,13 @@ ${JSON.stringify(computedStyles, null, 2)}
 
 **Image URLs** (use these exact absolute URLs as src attributes for <img> tags — do not use placeholder images):
 ${absoluteImageUrls.length > 0 ? absoluteImageUrls.map((u) => `- ${u}`).join("\n") : "- (none detected)"}
+
+**SVG assets** — treat programmed graphics as assets, not visuals to approximate.
+- For inline SVGs: copy the markup **verbatim** from the source HTML or from the list below. Do NOT redraw or simplify them.
+- For external SVG URLs (ending in .svg in the image list above): use them as \`src\` in an \`<img>\` tag exactly as-is.
+${inlineSvgs.length > 0
+  ? inlineSvgs.map((svg, i) => `<!-- SVG asset ${i + 1} -->\n${svg}`).join("\n\n")
+  : "- (no inline SVGs detected)"}
 
 Here is the HTML source of the page at ${url}:
 
