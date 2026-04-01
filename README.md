@@ -23,7 +23,30 @@ npm run generate -- <url>          # generate a page
 npm run generate -- <url> --open   # generate and open in browser
 ```
 
-Output goes to `output/`.
+All flags:
+
+```sh
+npm run generate -- <url> \
+  --name <label>        # human-readable name for the run (used in report title and output directory)
+  --iterations <n>      # max fix iterations (default: 4)
+  --threshold <n>       # convergence score delta threshold (default: 0.02)
+  --baseline            # also run the baseline agent and produce a side-by-side comparison report
+  --open                # open the generated file in the default browser
+```
+
+Output goes to `output/<timestamp>-<name|url-slug>/` and includes `run.ndjson`, `run.json`, `report.html`, and `main/<page>.html`.
+
+### Reference experiment
+
+To run the canonical reference experiment — experimental pipeline vs. baseline on the Stripe Canada payments page:
+
+```sh
+npm run generate -- https://stripe.com/en-ca/payments \
+  --name stripe-en-ca-payments-reference \
+  --baseline
+```
+
+This produces a `report.html` with a side-by-side fidelity score, cost, and duration comparison between the two pipelines. Use this as the control run when measuring the effect of any new integration.
 
 ## Development
 

@@ -5,24 +5,13 @@ const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 
-export interface StreamUsage {
-  tokensIn: number;
-  tokensOut: number;
-}
-
-export async function renderStream(runner: BetaToolRunner<true>): Promise<StreamUsage> {
+export async function renderStream(runner: BetaToolRunner<true>) {
   let currentBlockType: string | null = null;
   let hadToolUse = false;
-  let tokensIn = 0;
-  let tokensOut = 0;
 
   for await (const messageStream of runner) {
     for await (const event of messageStream) {
-      if (event.type === "message_start") {
-        tokensIn += event.message.usage.input_tokens;
-      } else if (event.type === "message_delta" && event.usage) {
-        tokensOut += event.usage.output_tokens ?? 0;
-      } else if (event.type === "content_block_start") {
+      if (event.type === "content_block_start") {
         if (event.content_block.type === "thinking") {
           currentBlockType = "thinking";
           process.stdout.write(dim("--- thinking ---\n"));
@@ -74,6 +63,4 @@ export async function renderStream(runner: BetaToolRunner<true>): Promise<Stream
 
     process.stdout.write("\n");
   }
-
-  return { tokensIn, tokensOut };
 }
