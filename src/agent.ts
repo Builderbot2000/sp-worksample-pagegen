@@ -4,6 +4,7 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import { renderStream } from "./render";
+import { enrichContext } from "./context";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
 import { estimateCost } from "./observability/metrics";
@@ -148,19 +149,27 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     },
   });
 
-  const { html: truncated, truncated: wasTruncated } = await fetchPage(url);
+  const context = await enrichContext(url);
 
   logger.log({
     phase: "fetch",
     timestamp: Date.now(),
     data: {
       url,
-      htmlBytes: truncated.length,
-      truncated: wasTruncated,
+      htmlBytes: context.html.length,
+      truncated: context.truncated,
+      enriched: true,
+      imageCount: context.imageUrls.length,
+      fontCount: context.fontFamilies.length,
     },
   });
 
   const generateStart = Date.now();
+
+  const stylesJson = JSON.stringify(context.computedStyles, null, 2);
+  const fontsText = context.fontFamilies.join(", ");
+  const imageUrlsText = context.imageUrls.join("\n");
+  const svgsText = context.svgs.join("\n");
 
   const runner = client.beta.messages.toolRunner({
     model: "claude-haiku-4-5",
@@ -169,26 +178,54 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     tool_choice: { type: "tool", name: "save_file" },
     stream: true,
     max_iterations: 1,
-    system: `You are a helpful assistant that generates HTML pages from source HTML.`,
+    system: `You are an expert front-end developer that generates pixel-faithful HTML pages from source pages.`,
     messages: [
       {
         role: "user",
-        content: `Create a single-file HTML page that recreates this page's content and visual design using Tailwind CSS (via CDN script tag). 
-        
-The page MUST:
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: context.screenshotBase64,
+            },
+          },
+          {
+            type: "text",
+            text: `The image above is a screenshot of the source page at ${url}. Use it as the primary visual reference.
 
+Create a single-file HTML page that recreates this page's content and visual design using Tailwind CSS (via CDN script tag).
+
+The page MUST:
 - Be a complete, self-contained HTML file
 - Use the Tailwind CSS CDN (<script src="https://cdn.tailwindcss.com"></script>)
-- Faithfully reproduce the layout, content, and visual style of the source page
+- Faithfully reproduce the layout, content, colours, typography, and visual style visible in the screenshot
+- Use the absolute image URLs provided below so assets resolve correctly
 - Be responsive and well-structured
+- Use descriptive kebab-case filename based on the source page's title or domain
 
-Use descriptive kebab-case filename based on the source page's title or domain.
+<computed_styles>
+${stylesJson}
+</computed_styles>
 
-Here is the HTML source of a webpage at ${url}:
+<fonts>
+${fontsText}
+</fonts>
+
+<image_urls>
+${imageUrlsText}
+</image_urls>
+
+<svgs>
+${svgsText}
+</svgs>
 
 <source_html>
-${truncated}
+${context.html}
 </source_html>`,
+          },
+        ],
       },
     ],
   });
@@ -226,7 +263,7 @@ ${truncated}
   if (opts.baseline) {
     const baselineDir = path.join(runDir, "baseline");
     console.log("\n[baseline] Running baseline agent...");
-    const bl = await runBaseline(url, baselineDir, truncated);
+    const bl = await runBaseline(url, baselineDir, context.html);
     baselineSavedPath = bl.savedPath;
     record.baseline = {
       baselineScore: 0,

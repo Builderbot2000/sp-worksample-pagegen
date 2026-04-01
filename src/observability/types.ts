@@ -8,6 +8,9 @@ export interface FetchData {
   url: string;
   htmlBytes: number;
   truncated: boolean;
+  enriched?: boolean;
+  imageCount?: number;
+  fontCount?: number;
 }
 
 export interface GenerateData {
