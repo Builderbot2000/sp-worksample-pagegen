@@ -8,7 +8,13 @@ import { enrichContext } from "./context";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
 import { estimateCost } from "./observability/metrics";
-import { collectFidelityMetrics } from "./observability/fidelity";
+import {
+  collectFidelityMetrics,
+  screenshotAndExtract,
+  computeVlmFidelityScore,
+  scoreSeverity,
+  captionDiscrepancies,
+} from "./observability/fidelity";
 import { generateReport } from "./observability/report";
 import type { RunRecord } from "./observability/types";
 
@@ -245,18 +251,173 @@ ${context.html}
     },
   });
 
-  const completedAt = Date.now();
-  const estimatedCostUsd = estimateCost("claude-haiku-4-5", tokensIn, tokensOut);
+  let totalTokensIn = tokensIn;
+  let totalTokensOut = tokensOut;
 
+  // ─── Run record (hoisted — iterations populated by loop below) ──────────────
   const record: RunRecord = {
     runId,
     ...(opts.name ? { name: opts.name } : {}),
     url,
     startedAt,
-    completedAt,
+    completedAt: 0,
     iterations: [],
-    estimatedCostUsd,
+    estimatedCostUsd: 0,
   };
+
+  // ─── Iterative fidelity loop ────────────────────────────────────────────────
+  const MAX_ITER = opts.iterations ?? 4;
+  const CONV_THRESHOLD = opts.threshold ?? 0.02;
+  const sourceBase64 = context.screenshotBase64;
+  let prevScore: number | null = null;
+
+  if (savedPath) {
+    for (let i = 0; i < MAX_ITER; i++) {
+      console.log(`\n[fidelity] Iteration ${i + 1}/${MAX_ITER} — scoring...`);
+
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      const { screenshot: genBuf } = await screenshotAndExtract({ file: savedPath! });
+      const genBase64 = genBuf.toString("base64");
+
+      const vlmScore = await computeVlmFidelityScore(sourceBase64, genBase64);
+      const severity = scoreSeverity(vlmScore.score);
+
+      logger.log({
+        phase: "diff",
+        timestamp: Date.now(),
+        data: { iteration: i + 1, vlmScore: vlmScore.score, vlmVerdict: vlmScore.verdict },
+      });
+
+      const iterRecord = {
+        iteration: i + 1,
+        vlmScore: vlmScore.score,
+        vlmVerdict: vlmScore.verdict,
+        severity,
+        discrepancyCount: 0,
+      };
+
+      console.log(`[fidelity] Score: ${vlmScore.score.toFixed(3)} (${severity})`);
+
+      if (severity === "low") {
+        console.log("[fidelity] Severity low — converged, stopping loop.");
+        record.iterations.push(iterRecord);
+        break;
+      }
+
+      if (prevScore !== null && Math.abs(vlmScore.score - prevScore) < CONV_THRESHOLD) {
+        console.log("[fidelity] Score delta below threshold — converged, stopping loop.");
+        record.iterations.push(iterRecord);
+        break;
+      }
+
+      console.log(`[fidelity] Captioning discrepancies...`);
+      const discrepancies = await captionDiscrepancies(sourceBase64, genBase64);
+
+      iterRecord.discrepancyCount = discrepancies.length;
+      record.iterations.push(iterRecord);
+
+      logger.log({
+        phase: "caption",
+        timestamp: Date.now(),
+        data: {
+          iteration: i + 1,
+          tokensIn: 0,
+          tokensOut: 0,
+          discrepancies,
+        },
+      });
+
+      if (discrepancies.length === 0) {
+        console.log("[fidelity] No actionable discrepancies — stopping loop.");
+        break;
+      }
+
+      console.log(`[fidelity] ${discrepancies.length} discrepancies — running fix pass...`);
+
+      const currentFilePath = savedPath!;
+      const currentHtml = fs.readFileSync(currentFilePath, "utf-8");
+      savedPath = null;
+
+      const fixSaveFile = betaZodTool({
+        name: "save_file",
+        description: "Save the fixed HTML page to disk.",
+        inputSchema: z.object({
+          filename: z.string().describe("Same kebab-case filename as the original."),
+          content: z.string().describe("The complete fixed HTML content of the page."),
+        }),
+        run: async (input) => {
+          const outPath = path.join(mainDir, input.filename);
+          fs.writeFileSync(outPath, input.content, "utf-8");
+          savedPath = outPath;
+          return JSON.stringify({ success: true, file_path: outPath });
+        },
+      });
+
+      const discrepancyList = discrepancies
+        .map((d) => `[${d.severity}] ${d.section}: ${d.issue}`)
+        .join("\n");
+
+      const fixStart = Date.now();
+      const fixRunner = client.beta.messages.toolRunner({
+        model: "claude-sonnet-4-6",
+        max_tokens: 32000,
+        tools: [fixSaveFile],
+        tool_choice: { type: "tool", name: "save_file" },
+        stream: true,
+        max_iterations: 1,
+        system: `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. You will be shown the source page screenshot and a list of specific discrepancies. Fix ONLY the listed issues — do not modify sections that are already correct.`,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: { type: "base64", media_type: "image/png", data: sourceBase64 },
+              },
+              {
+                type: "text",
+                text: `The image above is the SOURCE page you must match. The HTML below is the current reconstruction. Fix ONLY the discrepancies listed — do not change anything else.
+
+<discrepancies>
+${discrepancyList}
+</discrepancies>
+
+<current_html>
+${currentHtml}
+</current_html>`,
+              },
+            ],
+          },
+        ],
+      });
+
+      const { tokensIn: fixIn, tokensOut: fixOut } = await renderStream(fixRunner);
+      const fixDurationMs = Date.now() - fixStart;
+      totalTokensIn += fixIn;
+      totalTokensOut += fixOut;
+
+      logger.log({
+        phase: "fix",
+        timestamp: Date.now(),
+        data: {
+          iteration: i + 1,
+          model: "claude-sonnet-4-6",
+          tokensIn: fixIn,
+          tokensOut: fixOut,
+          durationMs: fixDurationMs,
+          htmlSizeDelta: savedPath
+            ? fs.readFileSync(savedPath, "utf-8").length - currentHtml.length
+            : 0,
+        },
+      });
+
+      prevScore = vlmScore.score;
+    }
+  }
+
+  // ─── Cost + record finalisation ─────────────────────────────────────────────
+  record.completedAt = Date.now();
+  record.estimatedCostUsd = estimateCost("claude-sonnet-4-6", totalTokensIn, totalTokensOut);
 
   let baselineSavedPath: string | null = null;
 
@@ -271,7 +432,7 @@ ${context.html}
       baselineDurationMs: bl.durationMs,
       baselineThumbnail: "",
       mainScore: 0,
-      mainCostUsd: estimatedCostUsd,
+      mainCostUsd: record.estimatedCostUsd,
       mainDurationMs: generateDurationMs,
       mainThumbnail: "",
     };
@@ -279,7 +440,7 @@ ${context.html}
   }
 
   if (savedPath) {
-    console.log("\n[fidelity] Computing fidelity metrics...");
+    console.log("\n[fidelity] Computing final fidelity metrics...");
     try {
       const fidelity = await collectFidelityMetrics(
         url,

@@ -171,6 +171,80 @@ export async function computeVlmFidelityScore(
   }
 }
 
+// ─── Severity band ────────────────────────────────────────────────────────────
+
+export function scoreSeverity(score: number): "high" | "medium" | "low" {
+  if (score > 0.85) return "low";
+  if (score >= 0.6) return "medium";
+  return "high";
+}
+
+// ─── Discrepancy captioner ─────────────────────────────────────────────────────
+
+const CAPTION_SYSTEM = `You are a visual discrepancy analyst. You will be shown two screenshots: SOURCE (original) and RECONSTRUCTION (generated). Identify specific visual issues in the reconstruction.
+
+Respond with ONLY a JSON array — no prose, no markdown fences. Each element must be:
+{ "section": "<page section>", "issue": "<specific problem>", "severity": "high" | "medium" }
+
+Only include high and medium severity issues (max 8). Do not include low-severity or cosmetic differences.
+"high": missing element, broken layout, wrong color scheme, completely absent section
+"medium": wrong spacing, font mismatch, partially missing content, misaligned element`;
+
+export interface Discrepancy {
+  section: string;
+  issue: string;
+  severity: "high" | "medium";
+}
+
+export async function captionDiscrepancies(
+  sourceBase64: string,
+  generatedBase64: string,
+): Promise<Discrepancy[]> {
+  try {
+    const response = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      system: CAPTION_SYSTEM,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: sourceBase64 },
+            },
+            { type: "text", text: "SOURCE screenshot above." },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: generatedBase64 },
+            },
+            {
+              type: "text",
+              text: "RECONSTRUCTION screenshot above. List all high and medium severity discrepancies as a JSON array.",
+            },
+          ],
+        },
+      ],
+    });
+
+    const text = response.content.find((b) => b.type === "text")?.text ?? "";
+    const cleaned = text.replace(/^```[^\n]*\n?|```$/gm, "").trim();
+    const parsed = JSON.parse(cleaned) as unknown[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (d): d is Discrepancy =>
+        typeof d === "object" &&
+        d !== null &&
+        "section" in d &&
+        "issue" in d &&
+        "severity" in d &&
+        ((d as Discrepancy).severity === "high" || (d as Discrepancy).severity === "medium"),
+    );
+  } catch {
+    return [];
+  }
+}
+
 // ─── DOM diff ─────────────────────────────────────────────────────────────────
 
 export function computeDomDiff(
