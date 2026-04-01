@@ -1,4 +1,62 @@
-# Project Plan 2: Fidelity Optimization — Theoretical Approaches
+# Project Plan: Superpilot Page Generation — Fidelity Improvement
+
+## Overview
+
+Extend the existing CLI tool with a richer generation pipeline that improves output fidelity through context enrichment, an iterative visual feedback loop, and a full observability layer. The central quality goal remains **fidelity** — how closely the generated page reproduces the source page's layout, copy, images, and visual theme.
+
+---
+
+## Context Enrichment
+
+Before the first generation pass, Puppeteer fetches the source page and extracts additional context to give Claude a richer prompt than raw HTML alone:
+
+- **Full-page screenshot** as visual ground truth passed alongside the HTML
+- **Computed styles** for key elements — colors, fonts, spacing — extracted via `getComputedStyle`
+- **Absolute image URLs** so assets resolve correctly in the generated output
+- **Inline SVGs and computed graphics** extracted and passed as assets directly, so the model never attempts to reconstruct logos or icons from scratch
+- **Font families** identified and injected as CDN imports
+
+---
+
+## Iterative Fidelity Loop
+
+After each generation, the output HTML is screenshotted and compared against the source using a VLM-based fault-finding strategy — the same approach already used in the observability layer.
+
+### Scoring
+
+The source screenshot and generated screenshot are passed to the VLM together. It returns a structured assessment: an overall 0–1 fidelity score, per-section verdicts, and a list of specific issues with severity labels.
+
+Severity bands:
+
+| Score | Severity |
+| --- | --- |
+| < 0.60 | high |
+| 0.60 – 0.85 | medium |
+| > 0.85 | low (not captioned) |
+
+### Fault Finding
+
+The VLM identifies both *where* things differ and *how* — missing elements, wrong colors, broken layout, copy mismatches — producing a structured discrepancy list directly usable as fix prompt input:
+
+```json
+{ "section": "hero", "issue": "background image missing, solid color used instead", "severity": "high" }
+```
+
+Only `high` and `medium` issues are passed to the fix prompt.
+
+### Fix Prompt
+
+The fix prompt passes Claude the current generated HTML alongside the structured discrepancy list, constraining it to repair only failing sections and leave correct ones untouched.
+
+### Stopping Conditions
+
+The loop continues until any of the following:
+- No `high` severity issues remain **and** score delta between iterations < 0.02
+- Hard cap of 4 iterations reached
+
+---
+
+## Fidelity Optimization — Theoretical Approaches
 
 ## Context
 

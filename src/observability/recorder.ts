@@ -26,5 +26,15 @@ export class Recorder {
       JSON.stringify(record, null, 2),
       "utf-8",
     );
+    const { fidelityMetrics, ...rest } = record;
+    const summaryFidelity = fidelityMetrics
+      ? (({ sourceScreenshotBase64, mainScreenshotBase64, baselineScreenshotBase64, ...metrics }) => metrics)(fidelityMetrics)
+      : undefined;
+    const summary = summaryFidelity ? { ...rest, fidelityMetrics: summaryFidelity } : rest;
+    fs.writeFileSync(
+      path.join(this.runDir, "summary.json"),
+      JSON.stringify(summary, null, 2),
+      "utf-8",
+    );
   }
 }

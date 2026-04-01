@@ -6,11 +6,20 @@ This project improves a page generation pipeline through a tight hypothesis-driv
 
 ## The Loop
 
-A hypothesis is formed about a specific weakness in the pipeline. It is implemented on the experimental path, leaving the baseline code untouched. The CLI is then run with `--baseline` so both paths execute against the same source URL in the same session, producing a `run.json` and `report.html` with a direct delta across fidelity score, cost, and duration. If the experimental path shows clear improvement, the change is committed to git and a new entry is added to `RESEARCH.md` capturing the hypothesis, what was changed, and the measured effect. If there is no improvement, the change is discarded and a new hypothesis is formed.
+1. Form a hypothesis about a specific weakness in the pipeline.
+2. Implement it on the experimental path, leaving the baseline code untouched.
+3. Run the CLI with `--baseline` so both paths execute against the same source URL in the same session.
+4. Review the `run.json` and `report.html` for a direct delta across fidelity score, cost, and duration.
+5. If the experimental path shows clear improvement, commit the change to git and add an entry to `RESEARCH.md` capturing the hypothesis, what was changed, and the measured effect.
+6. If there is no improvement, discard the change and return to step 1.
 
 ## What Counts as an Improvement
 
 The primary signal is fidelity score — the VLM-assigned closeness verdict and 0–1 score from the final iteration. Secondary signals are cost (estimated USD from token counts) and duration (wall-clock milliseconds). A change that raises fidelity while holding cost roughly flat is a clear win. A change that raises fidelity at meaningfully higher cost is a trade-off that needs justification. A change that moves cost or duration without moving fidelity is complexity without benefit and is discarded.
+
+## Outputs
+
+Experimental run output directories are numbered sequentially so they sort in order and each experiment can be compared directly against the prior stable iteration without needing to parse timestamps.
 
 ## Research Log
 
