@@ -10,8 +10,9 @@ This project improves a page generation pipeline through a tight hypothesis-driv
 2. Implement it on the experimental path, leaving the baseline code untouched.
 3. Run the CLI with `--baseline` so both paths execute against the same source URL in the same session.
 4. Review the `run.json` and `report.html` for a direct delta across fidelity score, cost, and duration.
-5. If the experimental path shows clear improvement, commit the change to git and add an entry to `RESEARCH.md` capturing the hypothesis, what was changed, and the measured effect.
-6. If there is no improvement, discard the change and return to step 1.
+5. If the experimental path shows clear improvement, run a duplicate test to check if the improvement is consistent or accidental
+7. If there is consistent improvement, commit the change to git and add an entry to `RESEARCH.md` capturing the hypothesis, what was changed, and the measured effect.
+8. If there is no improvement, discard the change and return to step 1.
 
 ## What Counts as an Improvement
 
