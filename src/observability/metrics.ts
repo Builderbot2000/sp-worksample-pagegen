@@ -38,3 +38,32 @@ export function checkConvergence(
 ): boolean {
   return Math.abs(currScore - prevScore) < threshold;
 }
+
+// \u2500\u2500\u2500 Iteration budget \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+import type { FidelityBudget } from "../agent";
+
+/**
+ * Compute the resolved iteration count for a run, scaled to the source page's
+ * heading count, clamped within the mode's min/max range.
+ *
+ * Formula:
+ *   structPassesNeeded = ceil(headingCount * 0.8 / structureBatchSize)
+ *   rawBudget          = structPassesNeeded + 2  (+1 content, +1 visual minimum)
+ *   resolvedMaxIter    = clamp(rawBudget, minIterations, maxIterations)
+ */
+export function computeIterBudget(
+  headingCount: number,
+  budget: FidelityBudget,
+): { resolvedMaxIter: number; rawBudget: number } {
+  if (budget.maxIterations === 0 || budget.structureBatchSize === undefined) {
+    return { resolvedMaxIter: 0, rawBudget: 0 };
+  }
+  const structPassesNeeded = Math.ceil((headingCount * 0.8) / budget.structureBatchSize);
+  const rawBudget = structPassesNeeded + 2;
+  const resolvedMaxIter = Math.max(
+    budget.minIterations,
+    Math.min(budget.maxIterations, rawBudget),
+  );
+  return { resolvedMaxIter, rawBudget };
+}

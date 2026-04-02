@@ -24,6 +24,7 @@ interface ScreenshotResult {
 
 export async function screenshotAndExtract(
   target: { url: string } | { file: string },
+  opts: { useWideViewport?: boolean } = {},
 ): Promise<ScreenshotResult> {
   const browser = await puppeteer.launch({
     headless: true,
@@ -60,15 +61,21 @@ export async function screenshotAndExtract(
     });
 
     // Second pass at 1920px to capture wide-viewport layout breakage
-    await page.setViewport({ width: 1920, height: 1080 });
-    const wideScrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
-    const wideCaptureHeight = Math.min(wideScrollHeight, MAX_SCREENSHOT_HEIGHT);
-    const screenshotWide = await page.screenshot({
-      type: "png",
-      clip: { x: 0, y: 0, width: 1920, height: wideCaptureHeight },
-    });
-    // Restore original viewport
-    await page.setViewport(VIEWPORT);
+    let screenshotWide: Awaited<ReturnType<typeof page.screenshot>>;
+    if (opts.useWideViewport !== false) {
+      await page.setViewport({ width: 1920, height: 1080 });
+      const wideScrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+      const wideCaptureHeight = Math.min(wideScrollHeight, MAX_SCREENSHOT_HEIGHT);
+      screenshotWide = await page.screenshot({
+        type: "png",
+        clip: { x: 0, y: 0, width: 1920, height: wideCaptureHeight },
+      });
+      // Restore original viewport
+      await page.setViewport(VIEWPORT);
+    } else {
+      // Use fold screenshot as a zero-cost stand-in; wide-viewport data won't be used.
+      screenshotWide = screenshotFold;
+    }
 
     const domInfo = await page.evaluate((): DomInfo => {
       const headingEls = Array.from(
@@ -247,6 +254,7 @@ export async function captionDiscrepancies(
   sourceBase64: string,
   generatedBase64: string,
   opts?: { sourceWideBase64?: string; generatedWideBase64?: string },
+  budgetOpts?: { maxTokens?: number },
 ): Promise<Discrepancy[]> {
   try {
     const userContent: Anthropic.MessageParam["content"] = [
@@ -287,7 +295,7 @@ export async function captionDiscrepancies(
 
     const response = await client.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 1024,
+      max_tokens: budgetOpts?.maxTokens ?? 1024,
       system: CAPTION_SYSTEM,
       messages: [{ role: "user", content: userContent }],
     });

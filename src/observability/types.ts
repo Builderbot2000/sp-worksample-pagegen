@@ -6,6 +6,10 @@ export type Severity = "high" | "medium" | "low";
 
 export type FidelityLevel = "structure" | "content" | "visual";
 
+// ─── Fidelity mode ────────────────────────────────────────────────────────────
+
+export type FidelityMode = "minimal" | "fast" | "balanced" | "high" | "maximal";
+
 // ─── Phase data interfaces ────────────────────────────────────────────────────
 
 export interface FetchData {
@@ -15,6 +19,9 @@ export interface FetchData {
   enriched?: boolean;
   imageCount?: number;
   fontCount?: number;
+  sourceHeadings?: number;
+  resolvedMaxIter?: number;
+  fidelityMode?: FidelityMode;
 }
 
 export interface GenerateData {

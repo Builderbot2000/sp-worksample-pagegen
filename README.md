@@ -28,11 +28,25 @@ All flags:
 ```sh
 npm run generate -- <url> \
   --name <label>        # human-readable name for the run (used in report title and output directory)
-  --iterations <n>      # max fix iterations (default: 4)
+  --fidelity <mode>     # quality/budget mode: minimal | fast | balanced | high | maximal (default: balanced)
   --threshold <n>       # convergence score delta threshold (default: 0.02)
   --baseline            # also run the baseline agent and produce a side-by-side comparison report
   --open                # open the generated file in the default browser
 ```
+
+### Fidelity modes
+
+The `--fidelity` flag controls the number of fix iterations, token budgets at each stage, and whether wide-viewport screenshots are captured. The iteration count also scales with the size of the source page — larger sites (more headings) get more iterations, up to the mode's ceiling.
+
+| Mode | Iterations | Struct batch | Wide viewport | Relative cost |
+|---|---|---|---|---|
+| `minimal` | 0 | — | No | ~$0.05 |
+| `fast` | 2–3 | 10 | No | ~$0.20 |
+| `balanced` | 3–6 | 15 | Yes | ~$0.50–1.50 |
+| `high` | 4–8 | 20 | Yes | ~$1.50–4.00 |
+| `maximal` | 6–12 | 30 | Yes | ~$4.00+ |
+
+If the source page is too large for the chosen mode to cover fully, a warning is printed at the start of the run suggesting a higher mode.
 
 Output goes to `output/<timestamp>-<name|url-slug>/` and includes `run.ndjson`, `run.json`, `report.html`, and `main/<page>.html`.
 
@@ -43,6 +57,7 @@ To run the canonical reference experiment — experimental pipeline vs. baseline
 ```sh
 npm run generate -- https://stripe.com/en-ca/payments \
   --name stripe-en-ca-payments-reference \
+  --fidelity balanced \
   --baseline
 ```
 

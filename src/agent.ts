@@ -7,7 +7,7 @@ import { renderStream } from "./render";
 import { enrichContext } from "./context";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
-import { estimateCost, estimateMaxTokens } from "./observability/metrics";
+import { estimateCost, estimateMaxTokens, computeIterBudget } from "./observability/metrics";
 import {
   collectFidelityMetrics,
   screenshotAndExtract,
@@ -19,17 +19,48 @@ import {
   computeDomDiff,
 } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
-import type { RunRecord, FidelityLevel } from "./observability/types";
+import type { RunRecord, FidelityLevel, FidelityMode } from "./observability/types";
 
 const BASELINE_MODEL = "claude-haiku-4-5";
 
 const client = new Anthropic();
 
+// ─── Fidelity budget ──────────────────────────────────────────────────────────
+
+export interface FidelityBudget {
+  minIterations: number;
+  maxIterations: number;
+  /** Headings per structure-level fix pass. undefined = no structure passes. */
+  structureBatchSize: number | undefined;
+  /** Hard cap for initial generation. null = use estimateMaxTokens() dynamically. */
+  generateMaxTokens: number | null;
+  /**
+   * Floor for structure fix pass max_tokens. Actual value =
+   * Math.max(structureFixFloor, estimateMaxTokens(currentHtml.length, model)).
+   * undefined = no structure passes (minimal mode).
+   */
+  structureFixFloor: number | undefined;
+  /** null = use estimateMaxTokens() dynamically. */
+  contentFixMaxTokens: number | null;
+  /** null = use estimateMaxTokens() dynamically. */
+  visualFixMaxTokens: number | null;
+  captionMaxTokens: number;
+  useWideViewport: boolean;
+}
+
+const FIDELITY_BUDGETS: Record<FidelityMode, FidelityBudget> = {
+  minimal:  { minIterations: 0,  maxIterations: 0,  structureBatchSize: undefined, generateMaxTokens: 8_000,  structureFixFloor: undefined, contentFixMaxTokens: null,   visualFixMaxTokens: null,   captionMaxTokens: 1_024, useWideViewport: false },
+  fast:     { minIterations: 2,  maxIterations: 3,  structureBatchSize: 10,        generateMaxTokens: 12_000, structureFixFloor: 24_576,   contentFixMaxTokens: 32_768, visualFixMaxTokens: 24_576, captionMaxTokens: 512,   useWideViewport: false },
+  balanced: { minIterations: 3,  maxIterations: 6,  structureBatchSize: 15,        generateMaxTokens: null,   structureFixFloor: 40_960,   contentFixMaxTokens: null,   visualFixMaxTokens: null,   captionMaxTokens: 1_024, useWideViewport: true  },
+  high:     { minIterations: 4,  maxIterations: 8,  structureBatchSize: 20,        generateMaxTokens: null,   structureFixFloor: 49_152,   contentFixMaxTokens: 65_536, visualFixMaxTokens: 65_536, captionMaxTokens: 1_024, useWideViewport: true  },
+  maximal:  { minIterations: 6,  maxIterations: 12, structureBatchSize: 30,        generateMaxTokens: null,   structureFixFloor: 57_344,   contentFixMaxTokens: 65_536, visualFixMaxTokens: 65_536, captionMaxTokens: 2_048, useWideViewport: true  },
+};
+
 const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
 
 export interface GenerateOptions {
   name?: string;
-  iterations?: number;
+  fidelity?: FidelityMode;
   threshold?: number;
   baseline?: boolean;
   open?: boolean;
@@ -160,6 +191,24 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
 
   const context = await enrichContext(url);
 
+  const budget = FIDELITY_BUDGETS[opts.fidelity ?? "balanced"];
+  const sourceHeadings = context.domInfo.headings.length;
+  const { resolvedMaxIter, rawBudget } = computeIterBudget(sourceHeadings, budget);
+
+  if (budget.maxIterations > 0 && rawBudget > budget.maxIterations) {
+    const fidelityMode = opts.fidelity ?? "balanced";
+    const modeOrder: FidelityMode[] = ["fast", "balanced", "high", "maximal"];
+    const nextMode = modeOrder[modeOrder.indexOf(fidelityMode as FidelityMode) + 1];
+    const structPasses = resolvedMaxIter - 2;
+    const coveredHeadings = structPasses * (budget.structureBatchSize ?? 0);
+    const requiredHeadings = Math.ceil(sourceHeadings * 0.8);
+    const pct = Math.round((coveredHeadings / requiredHeadings) * 100);
+    const suggestion = nextMode ? ` Consider --fidelity ${nextMode}.` : "";
+    console.warn(
+      `[budget] Site has ${sourceHeadings} headings; ${fidelityMode} mode will cover ~${coveredHeadings}/${requiredHeadings} structure sections (~${pct}%).${suggestion}`,
+    );
+  }
+
   logger.log({
     phase: "fetch",
     timestamp: Date.now(),
@@ -170,6 +219,9 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
       enriched: true,
       imageCount: context.imageUrls.length,
       fontCount: context.fontFamilies.length,
+      sourceHeadings,
+      resolvedMaxIter,
+      fidelityMode: opts.fidelity ?? "balanced",
     },
   });
 
@@ -182,7 +234,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
 
   const runner = client.beta.messages.toolRunner({
     model: "claude-haiku-4-5",
-    max_tokens: estimateMaxTokens(context.html.length, "claude-haiku-4-5"),
+    max_tokens: budget.generateMaxTokens ?? estimateMaxTokens(context.html.length, "claude-haiku-4-5"),
     tools: [saveFile],
     tool_choice: { type: "tool", name: "save_file" },
     stream: true,
@@ -272,7 +324,7 @@ ${context.html}
   };
 
   // ─── Iterative fidelity loop ────────────────────────────────────────────────
-  const MAX_ITER = opts.iterations ?? 4;
+  const MAX_ITER = resolvedMaxIter;
   const CONV_THRESHOLD = opts.threshold ?? 0.02;
   const sourceFoldBase64 = context.screenshotFoldBase64;
   const sourceBase64 = context.screenshotBase64;
@@ -286,7 +338,7 @@ ${context.html}
 
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       const { screenshot: genBuf, screenshotFold: genFoldBuf, screenshotWide: genWideBuf, domInfo: genDomInfo } =
-        await screenshotAndExtract({ file: savedPath! });
+        await screenshotAndExtract({ file: savedPath! }, { useWideViewport: budget.useWideViewport });
       const genBase64 = genBuf.toString("base64");
       const genFoldBase64 = genFoldBuf.toString("base64");
       const genWideBase64 = genWideBuf.toString("base64");
@@ -375,7 +427,7 @@ ${context.html}
       let fixUserText: string;
       let fixImageBase64: string;
 
-      const STRUCTURE_BATCH = 15;
+      const STRUCTURE_BATCH = budget.structureBatchSize ?? 15;
       if (level === "structure") {
         const batch = domDiff.missingHeadings.slice(0, STRUCTURE_BATCH);
         const missingList = batch.join("\n");
@@ -413,10 +465,12 @@ ${currentHtml}
       } else {
         // Level 3: visual fix using VLM discrepancy list
         console.log(`[fidelity] Captioning discrepancies...`);
-        const discrepancies = await captionDiscrepancies(sourceFoldBase64, genFoldBase64, {
-          sourceWideBase64,
-          generatedWideBase64: genWideBase64,
-        });
+        const discrepancies = await captionDiscrepancies(
+          sourceFoldBase64,
+          genFoldBase64,
+          budget.useWideViewport ? { sourceWideBase64, generatedWideBase64: genWideBase64 } : undefined,
+          { maxTokens: budget.captionMaxTokens },
+        );
         iterRecord.discrepancyCount = discrepancies.length;
 
         logger.log({
@@ -449,11 +503,16 @@ ${currentHtml}
       record.iterations.push(iterRecord);
 
       const fixStart = Date.now();
+      const fixMaxTokens =
+        level === "structure"
+          ? Math.max(budget.structureFixFloor ?? 40_960, estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"))
+          : level === "content"
+          ? (budget.contentFixMaxTokens ?? estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"))
+          : (budget.visualFixMaxTokens ?? estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"));
+
       const fixRunner = client.beta.messages.toolRunner({
         model: "claude-sonnet-4-6",
-        max_tokens: level === "structure"
-          ? 65536
-          : estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"),
+        max_tokens: fixMaxTokens,
         tools: [fixSaveFile],
         tool_choice: { type: "tool", name: "save_file" },
         stream: true,
