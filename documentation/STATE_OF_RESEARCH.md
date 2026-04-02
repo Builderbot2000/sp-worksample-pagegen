@@ -118,7 +118,7 @@ With 74 missing headings and a batch size of 15, structure resolution alone need
 **Issue 2: Structure fix pass rewrites the entire HTML document.**
 Asking the model to output the full HTML (growing to 200KB+) just to append 15 new sections is extremely expensive (~$0.75/pass, ~9min/pass). Fix: switch to fragment-only output — model emits only the new section HTML, code injects it before `</body>`. This reduces structure pass cost ~10× and eliminates the Anthropic token limit risk.
 
-**Issue 3: Below-fold content score plateau in the old VLM loop.** 
+**Issue 3: Below-fold content score plateau in the old VLM loop.**
 Runs 4–7 confirm the VLM fold loop plateaus at 0.62–0.75 regardless of iteration count. The first-fold VLM is blind to missing sections further down the page. The tiered DOM approach addresses this directly (DOM score 0.071 → 0.789 in run 8).
 
 **Issue 4: DOM `missingHeadings` list is embedded in the fix prompt verbatim.**
