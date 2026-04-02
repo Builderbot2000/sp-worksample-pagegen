@@ -110,21 +110,34 @@ The cost ($3.16) is driven by the fix-pass model (Sonnet) rewriting the full HTM
 
 ---
 
+### 9. `fl-budget-patch` / `quality-mode` (fragment structure pass) — 1775093833723, 1775094880065, 1775095xxx
+
+Attempted to address Issue 2 (cost of full-document rewrite) by switching the structure pass to a fragment-only output: model emits only new `<section>` blocks which are injected before `</body>`. Also introduced per-level iteration caps (Issue 1) and the `--quality` flag with auto-computed iteration budget based on source heading count.
+
+Main: **worse than run 8** · Baseline: 0.20
+
+**Observations:**
+Fragment injection significantly degrades fidelity compared to the full-rewrite pass in run 8. Three root causes are apparent. First, sections are always appended at the bottom of `<body>` regardless of where they belong in page flow — Stripe's page has interleaved sections (nav subsections, in-page component variants) that must appear between existing elements, not after the footer. Second, the model only sees the first 8KB of the document as style context, which is insufficient once the document grows through multiple injection passes — by pass 4 the style reference misses all established patterns. Third, each pass is blind to what prior passes already injected, making deduplication and ordering impossible.
+
+The per-level iteration budget and `--quality` mode are working correctly as infrastructure — the computed budgets are right and the level-forcing logic behaves as expected. These carry forward unchanged.
+
+Conclusion: Fragment injection is not viable for the structure pass. Full-document rewrite is the correct approach. The cost problem must be solved differently (e.g. targeted edit instructions with structured output, or a smaller model for structure passes).
+
+---
+
 ## Known Issues & Next Steps
 
-**Issue 1: Structure level exhausts the full iteration budget.**
-With 74 missing headings and a batch size of 15, structure resolution alone needs 5+ iterations. The loop hits `MAX_ITER=4` before reaching content or visual levels. Fix: dedicate an iteration sub-budget per level, or track remaining work at each level independently.
+**Issue 1: Structure level exhausts the full iteration budget.** ✓ Resolved via per-level caps and `--quality` auto-budget. The `computeIterBudget` function sizes structure passes as `ceil(sourceHeadings × 0.8 / batch)`, ensuring the structure level completes before content and visual passes run. Needs re-validation with full-pass architecture.
 
 **Issue 2: Structure fix pass rewrites the entire HTML document.**
-Asking the model to output the full HTML (growing to 200KB+) just to append 15 new sections is extremely expensive (~$0.75/pass, ~9min/pass). Fix: switch to fragment-only output — model emits only the new section HTML, code injects it before `</body>`. This reduces structure pass cost ~10× and eliminates the Anthropic token limit risk.
+Fragment injection (run 9) was attempted as the fix and caused significant quality regression. The correct approach is full-document rewrite retained, with cost reduction explored via a smaller model for structure passes or structured-edit output (model emits targeted insertion instructions rather than full HTML). Open.
 
-**Issue 3: Below-fold content score plateau in the old VLM loop.**
-Runs 4–7 confirm the VLM fold loop plateaus at 0.62–0.75 regardless of iteration count. The first-fold VLM is blind to missing sections further down the page. The tiered DOM approach addresses this directly (DOM score 0.071 → 0.789 in run 8).
+**Issue 3: Below-fold content score plateau in the old VLM loop.** ✓ Resolved by the DOM-tiered dispatch introduced in run 8. Run 9 regressed due to the fragment approach, not the tier architecture.
 
-**Issue 4: DOM `missingHeadings` list is embedded in the fix prompt verbatim.**
-This caused the `run.json`/`summary.json` to be malformed in run 8 (the heading strings broke JSON serialisation when logged). The domDiff data needs to be kept separate from the serialised `iterRecord`.
+**Issue 4: `summary.json` / `run.json` serialisation corruption.**
+Previously hypothesised to be caused by raw heading strings in the logged iteration record. More likely the actual cause is thumbnail base64 image data being embedded directly in `summary.json` — observed in recent runs where the file is abnormally large. The `missingHeadings` array was already excluded from `iterRecord`; the thumbnail fields in `BaselineComparison` are the probable culprit. Fix: strip thumbnail base64 from `summary.json` (keep in `run.json` only; or write thumbnails to separate files). Open.
 
 **Planned next iteration:**
-- Fragment-only structure pass (model outputs `<section>...</section>` blocks only, injected before `</body>`)
-- Per-level iteration sub-budget (`structureIter = ceil(missing/batch)` capped at e.g. 6, `contentIter = 2`, `visualIter = remaining`)
-- Fix `run.json` serialisation (strip `missingHeadings` array from logged iteration records)
+- Revert structure pass to full-document rewrite (restore run 8 approach)
+- Re-run with `--quality balanced` to validate iteration budget against full-pass architecture
+- Fix `summary.json` thumbnail serialisation (strip `mainThumbnail` / `baselineThumbnail` base64 from summary)

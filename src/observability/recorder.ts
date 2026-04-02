@@ -21,19 +21,32 @@ export class Recorder {
 
   finalize(record: RunRecord): void {
     this.stream.end();
+
+    const stripImages = (r: RunRecord): RunRecord => {
+      const { fidelityMetrics, baseline, ...rest } = r;
+      const strippedFidelity = fidelityMetrics
+        ? (({ sourceScreenshotBase64, mainScreenshotBase64, baselineScreenshotBase64, ...metrics }) => metrics)(fidelityMetrics)
+        : undefined;
+      const strippedBaseline = baseline
+        ? { ...baseline, mainThumbnail: "", baselineThumbnail: "" }
+        : undefined;
+      return {
+        ...rest,
+        ...(strippedFidelity !== undefined ? { fidelityMetrics: strippedFidelity } : {}),
+        ...(strippedBaseline !== undefined ? { baseline: strippedBaseline } : {}),
+      };
+    };
+
+    const stripped = stripImages(record);
+
     fs.writeFileSync(
       path.join(this.runDir, "run.json"),
-      JSON.stringify(record, null, 2),
+      JSON.stringify(stripped, null, 2),
       "utf-8",
     );
-    const { fidelityMetrics, ...rest } = record;
-    const summaryFidelity = fidelityMetrics
-      ? (({ sourceScreenshotBase64, mainScreenshotBase64, baselineScreenshotBase64, ...metrics }) => metrics)(fidelityMetrics)
-      : undefined;
-    const summary = summaryFidelity ? { ...rest, fidelityMetrics: summaryFidelity } : rest;
     fs.writeFileSync(
       path.join(this.runDir, "summary.json"),
-      JSON.stringify(summary, null, 2),
+      JSON.stringify(stripped, null, 2),
       "utf-8",
     );
   }
