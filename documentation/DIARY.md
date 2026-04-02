@@ -6,3 +6,9 @@
 
 4. Switched from pixeldiff to VLM based semantic similarity for generation of fidelity metrics
 
+5. VLM semantic similarity was switched out for DOM scoring then back
+
+6. A whole new workflow replaced the VLM scoring loops with discrepancy checks
+
+7. 
+

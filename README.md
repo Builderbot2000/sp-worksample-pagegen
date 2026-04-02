@@ -85,7 +85,56 @@ Output goes to `output/<timestamp>-<name|preprocess-test>/` and includes `arch.j
 
 ```sh
 # Example
-npm run test:preprocess -- https://stripe.com/payments --name stripe-payments
+npm run test:preprocess -- https://stripe.com/payments --name stripe-preprocessing-test
+```
+
+### Generate test
+
+Runs the crawl + initial generation step in isolation (no fidelity loop, no patching). Useful for iterating on the generation prompt without waiting for the full pipeline.
+
+```sh
+npm run test:generate -- <url>
+npm run test:generate -- <url> --name <label>
+npm run test:generate -- <url> --name <label> --out <dir>
+```
+
+Output goes to `output/<timestamp>-<name|generate-test>/` and includes `main/<page>.html`, `screenshot.png`, `arch.json`, and `report.html`.
+
+```sh
+# Example
+npm run test:generate -- https://stripe.com/payments --name stripe-initial-gen-test
+```
+
+### Correction loop test
+
+Runs the full crawl → initial generation → correction loop in isolation and produces a visual iteration-by-iteration report. Useful for inspecting what the section scorer finds, how discrepancies evolve across iterations, and whether fixes are taking effect.
+
+```sh
+npm run test:correction-loop -- <url>
+npm run test:correction-loop -- <url> --name <label>
+npm run test:correction-loop -- <url> --name <label> --out <dir> --max-iter <n>
+```
+
+Flags:
+
+```sh
+--name <label>     # label for the output directory (default: correction-loop-test)
+--out <dir>        # explicit output directory
+--max-iter <n>     # max correction iterations (default: 4)
+```
+
+Output goes to `output/<timestamp>-<name|correction-loop-test>/` and includes `main/<page>.html` and `report.html`.
+
+The report shows one card per iteration with:
+- Aggregate fidelity score, severity, and section match stats
+- Side-by-side source vs generated screenshots for every section with issues or newly resolved
+- Discrepancies labeled **NEW** or **PERSISTS**, with individual issues marked when carried over from the previous iteration
+- Sections resolved since the previous iteration highlighted with a **✓ RESOLVED** badge
+- Collapsible list of passing sections
+
+```sh
+# Example
+npm run test:correction-loop -- https://stripe.com/payments --name stripe-correction-test
 ```
 
 ## The Challenge

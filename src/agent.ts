@@ -3,6 +3,7 @@ import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
+import sharp from "sharp";
 import { renderStream } from "./render";
 import { crawlAndPreprocess } from "./context";
 import { Recorder } from "./observability/recorder";
@@ -22,6 +23,16 @@ const GENERATE_MODEL = "claude-sonnet-4-6";
 const FIX_MODEL = "claude-haiku-4-5";
 
 const client = new Anthropic();
+
+// ─── VLM image helpers ────────────────────────────────────────────────────────
+
+/** Resize a section screenshot to a resolution optimised for Claude VLM input. */
+async function resizeForVlm(buf: Buffer): Promise<Buffer> {
+  return sharp(buf)
+    .resize({ width: 1024, withoutEnlargement: true })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+}
 
 // ─── Fidelity budget ──────────────────────────────────────────────────────────
 
@@ -219,9 +230,28 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
   const svgsText = crawlResult.svgs.join("\n");
   const archDocText = formatArchDoc(archDoc);
 
+  // Build interleaved section screenshot blocks for VLM reference
+  type ContentBlock = Anthropic.TextBlockParam | Anthropic.ImageBlockParam;
+  const sectionVisualBlocks: ContentBlock[] = [];
+  for (const section of archDoc.sections) {
+    const screenshots = crawlResult.sourceSectionScreenshots[section.slug];
+    if (screenshots?.[0]) {
+      const resized = await resizeForVlm(screenshots[0]);
+      sectionVisualBlocks.push({
+        type: "text",
+        text: `Section ${section.order} — slug: "${section.slug}" | role: ${section.role}\n${section.description}`,
+      });
+      sectionVisualBlocks.push({
+        type: "image",
+        source: { type: "base64", media_type: "image/jpeg", data: resized.toString("base64") },
+      });
+    }
+  }
+
   const runner = client.beta.messages.toolRunner({
     model: GENERATE_MODEL,
     max_tokens: budget.generateMaxTokens ?? estimateMaxTokens(crawlResult.html.length, GENERATE_MODEL),
+    thinking: { type: "disabled" },
     tools: [saveFile],
     tool_choice: { type: "tool", name: "save_file" },
     stream: true,
@@ -238,28 +268,22 @@ These attributes are mandatory — the correction system identifies and scores s
         role: "user",
         content: [
           {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: "image/png",
-              data: crawlResult.screenshotBase64,
-            },
+            type: "text",
+            text: "Below are screenshots of each visual section of the source page, in order. Use them as a visual reference when recreating the layout, colours, and styling.",
           },
+          ...sectionVisualBlocks,
           {
             type: "text",
-            text: `The image above is a screenshot of the source page at ${url}. Use it as the primary visual reference.
-
-Create a single-file HTML page that recreates this page's content and visual design using Tailwind CSS (via CDN script tag).
+            text: `Create a single-file HTML page that recreates the source page at ${url} using Tailwind CSS (via CDN script tag).
 
 The page MUST:
 - Be a complete, self-contained HTML file
 - Use the Tailwind CSS CDN (<script src="https://cdn.tailwindcss.com"></script>)
-- Faithfully reproduce the layout, content, colours, typography, and visual style visible in the screenshot
+- Faithfully reproduce the layout, content, colours, typography, and visual style of the source page
 - Use the absolute image URLs provided below so assets resolve correctly
 - Be responsive across all viewport widths from 375px (mobile) through 2560px+ (large desktop):
   - Use Tailwind's max-w-* and mx-auto for all layout containers — never use fixed pixel widths
   - Use xl: and 2xl: breakpoint variants to keep proportions correct at wide viewports
-  - The reference screenshot is captured at 1280px; ensure nothing is broken or unnaturally stretched beyond that
 - Use descriptive kebab-case filename based on the source page's title or domain
 
 SECTION LABELS (hard constraint):
@@ -400,9 +424,14 @@ ${crawlResult.html}
         .join("\n");
 
       const fixStart = Date.now();
+      // Always allocate enough tokens to emit the full HTML plus 25% headroom.
+      // Haiku caps at 32K output; if the page needs more, bump to Sonnet's 64K ceiling.
+      const htmlTokenEstimate = Math.ceil(currentHtml.length / 4);
+      const patchTokensNeeded = Math.ceil(htmlTokenEstimate * 1.25);
+      const fixMaxTokens = budget.patchMaxTokens ?? Math.min(patchTokensNeeded, 32_768);
       const fixRunner = client.beta.messages.toolRunner({
         model: FIX_MODEL,
-        max_tokens: budget.patchMaxTokens ?? estimateMaxTokens(currentHtml.length, FIX_MODEL),
+        max_tokens: fixMaxTokens,
         tools: [fixSaveFile],
         tool_choice: { type: "tool", name: "save_file" },
         stream: true,

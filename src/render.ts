@@ -5,6 +5,8 @@ const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 export interface StreamUsage {
   tokensIn: number;
   tokensOut: number;
@@ -15,6 +17,8 @@ export async function renderStream(runner: BetaToolRunner<true>): Promise<Stream
   let hadToolUse = false;
   let tokensIn = 0;
   let tokensOut = 0;
+  let spinnerFrame = 0;
+  let inputJsonChunks = 0;
 
   for await (const messageStream of runner) {
     for await (const event of messageStream) {
@@ -29,8 +33,10 @@ export async function renderStream(runner: BetaToolRunner<true>): Promise<Stream
         } else if (event.content_block.type === "tool_use") {
           currentBlockType = "tool_use";
           hadToolUse = true;
+          spinnerFrame = 0;
+          inputJsonChunks = 0;
           process.stdout.write(
-            cyan(`\n🔧 Tool call: ${event.content_block.name}\n`),
+            cyan(`\n🔧 Tool call: ${event.content_block.name} `),
           );
         } else if (event.content_block.type === "text") {
           currentBlockType = "text";
@@ -41,13 +47,19 @@ export async function renderStream(runner: BetaToolRunner<true>): Promise<Stream
         } else if (event.delta.type === "text_delta") {
           process.stdout.write(event.delta.text);
         } else if (event.delta.type === "input_json_delta") {
-          process.stdout.write(yellow("."));
+          inputJsonChunks++;
+          if (inputJsonChunks % 3 === 0) {
+            process.stdout.write(
+              `\b${yellow(SPINNER_FRAMES[spinnerFrame % SPINNER_FRAMES.length])}`,
+            );
+            spinnerFrame++;
+          }
         }
       } else if (event.type === "content_block_stop") {
         if (currentBlockType === "thinking") {
           process.stdout.write(dim("\n--- /thinking ---\n"));
         } else if (currentBlockType === "tool_use") {
-          process.stdout.write(green(" ✓\n"));
+          process.stdout.write(`\b${green("✓")}\n`);
         }
         currentBlockType = null;
       }
