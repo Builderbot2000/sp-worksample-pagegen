@@ -1,6 +1,7 @@
 import puppeteer from "puppeteer";
 import Anthropic from "@anthropic-ai/sdk";
 import * as path from "path";
+import { PNG } from "pngjs";
 import type {
   VlmFidelityScore,
   VlmVerdict,
@@ -18,6 +19,22 @@ const SECTION_TALL_THRESHOLD = 1350;
 const MAX_SECTION_PAIRS = 15;
 
 const client = new Anthropic();
+
+// ─── Stitch PNG buffers vertically into one image ────────────────────────────
+
+function stitchVertically(buffers: Buffer[]): Buffer {
+  if (buffers.length === 1) return buffers[0];
+  const pngs = buffers.map((b) => PNG.sync.read(b));
+  const width = pngs[0].width;
+  const totalHeight = pngs.reduce((sum, p) => sum + p.height, 0);
+  const out = new PNG({ width, height: totalHeight });
+  let yOffset = 0;
+  for (const p of pngs) {
+    PNG.bitblt(p, out, 0, 0, width, p.height, 0, yOffset);
+    yOffset += p.height;
+  }
+  return PNG.sync.write(out);
+}
 
 // ─── Screenshot sections by slug ─────────────────────────────────────────────
 
@@ -53,13 +70,13 @@ export async function screenshotSectionsBySlug(
 
     const result: Record<string, Buffer[]> = {};
     for (const { slug, y, height } of sectionRects) {
-      const screenshots: Buffer[] = [];
+      const crops: Buffer[] = [];
       const clipY = Math.max(0, Math.min(y, scrollHeight - VIEWPORT.height));
       const buf1 = await page.screenshot({
         type: "png",
         clip: { x: 0, y: clipY, width: VIEWPORT.width, height: VIEWPORT.height },
       });
-      screenshots.push(Buffer.from(buf1));
+      crops.push(Buffer.from(buf1));
 
       if (height > SECTION_TALL_THRESHOLD) {
         const clipY2 = Math.max(
@@ -70,9 +87,9 @@ export async function screenshotSectionsBySlug(
           type: "png",
           clip: { x: 0, y: clipY2, width: VIEWPORT.width, height: VIEWPORT.height },
         });
-        screenshots.push(Buffer.from(buf2));
+        crops.push(Buffer.from(buf2));
       }
-      result[slug] = screenshots;
+      result[slug] = [stitchVertically(crops)];
     }
     return result;
   } finally {
@@ -147,20 +164,16 @@ export async function computeSectionDiscrepancies(
       const spec = archDoc.sections.find((s) => s.slug === slug);
       const label = spec ? `${slug} (${spec.role})` : slug;
 
-      for (const buf of sourceImgs) {
-        userContent.push({
-          type: "image",
-          source: { type: "base64", media_type: "image/png", data: buf.toString("base64") },
-        });
-      }
+      userContent.push({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: sourceImgs[0].toString("base64") },
+      });
       userContent.push({ type: "text", text: `Section "${label}" — SOURCE above.` });
 
-      for (const buf of genImgs) {
-        userContent.push({
-          type: "image",
-          source: { type: "base64", media_type: "image/png", data: buf.toString("base64") },
-        });
-      }
+      userContent.push({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: genImgs[0].toString("base64") },
+      });
       userContent.push({ type: "text", text: `Section "${label}" — RECONSTRUCTION above.` });
     }
     userContent.push({

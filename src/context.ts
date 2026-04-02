@@ -1,16 +1,29 @@
 import puppeteer from "puppeteer";
-import Anthropic from "@anthropic-ai/sdk";
+import { PNG } from "pngjs";
 import type { VisualArchDoc, SectionSpec } from "./observability/types";
+
+function stitchVertically(buffers: Buffer[]): Buffer {
+  if (buffers.length === 1) return buffers[0];
+  const pngs = buffers.map((b) => PNG.sync.read(b));
+  const width = pngs[0].width;
+  const totalHeight = pngs.reduce((sum, p) => sum + p.height, 0);
+  const out = new PNG({ width, height: totalHeight });
+  let yOffset = 0;
+  for (const p of pngs) {
+    PNG.bitblt(p, out, 0, 0, width, p.height, 0, yOffset);
+    yOffset += p.height;
+  }
+  return PNG.sync.write(out);
+}
 
 const VIEWPORT = { width: 1280, height: 900 };
 const MAX_HTML_CHARS = 80_000;
 const MAX_SCREENSHOT_HEIGHT = 7800;
 // ~150% of viewport height — sections taller than this get two screenshots
 const SECTION_TALL_THRESHOLD = 1350;
-// Hard cap on sections passed to the VLM arch-doc call
+// Hard cap on detected sections
 const MAX_SECTIONS = 20;
 
-const client = new Anthropic();
 
 export interface ComputedStyleEntry {
   selector: string;
@@ -32,27 +45,6 @@ export interface CrawlResult {
   visualArchDoc: VisualArchDoc;
   sourceSectionScreenshots: Record<string, Buffer[]>;
 }
-
-// ─── VLM system prompt for architecture doc ───────────────────────────────────
-
-const ARCH_DOC_SYSTEM = `You are a web page visual architect. You will be shown a full-page screenshot followed by per-section screenshots with their slug candidates derived from the DOM.
-
-Your task is to enrich the visual architecture document with descriptions and roles.
-
-Respond with ONLY a JSON object — no prose, no markdown fences:
-{
-  "fixedElements": ["<description of each fixed or sticky UI element visible across the page>"],
-  "backgroundDescription": "<overall background color scheme and any global decorative patterns>",
-  "sections": [
-    {
-      "slug": "<use the provided slug candidate; improve it only if it is generic like 'section-1' or 'div-3'>",
-      "description": "<detailed description of the section's visual content and layout>",
-      "role": "<functional role, e.g. hero, navbar, pricing, testimonials, cta, features, footer>"
-    }
-  ]
-}
-
-Preserve slug candidates exactly unless they are clearly non-descriptive. Sections must appear in the same order as presented.`;
 
 // ─── Main crawl function ──────────────────────────────────────────────────────
 
@@ -139,71 +131,111 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
     const rawSections = await page.evaluate((tallThreshold: number) => {
       const SEMANTIC = "section, article, main, header, footer, nav";
 
-      function isFixedOrSticky(el: Element): boolean {
-        const pos = getComputedStyle(el).position;
-        return pos === "fixed" || pos === "sticky";
-      }
+      // Helper methods use object method shorthand to avoid esbuild __name injection
+      // (which would reference a Node-side helper that doesn't exist in the browser).
+      const h = {
+        isFixedOrSticky(el: Element): boolean {
+          const pos = getComputedStyle(el).position;
+          return pos === "fixed" || pos === "sticky";
+        },
 
-      function deriveSlugCandidate(el: Element, order: number): string {
-        const tag = el.tagName.toLowerCase();
-        if (el.id) {
-          const s = el.id.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
-          if (s) return s;
-        }
-        const aria = el.getAttribute("aria-label");
-        if (aria) {
-          const s = aria.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
-          if (s) return s;
-        }
-        const h = el.querySelector("h1,h2,h3,h4,h5,h6");
-        if (h?.textContent) {
-          const s = h.textContent.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
-          if (s) return s;
-        }
-        return `${tag}-${order}`;
-      }
-
-      function collectFromList(
-        list: Element[],
-      ): Array<{ tag: string; slugCandidate: string; y: number; height: number }> {
-        const results: Array<{ tag: string; slugCandidate: string; y: number; height: number }> = [];
-        let order = 1;
-        for (const el of list) {
-          if (isFixedOrSticky(el)) continue;
-          const rect = el.getBoundingClientRect();
-          const y = rect.top + window.scrollY;
-          const height = rect.height;
-          if (height < 50) continue;
-
-          if (height > tallThreshold) {
-            // Recursive descent: find direct semantic children (non-fixed/sticky)
-            const directSemanticChildren = Array.from(
-              el.querySelectorAll(
-                ":scope > section, :scope > article, :scope > main, :scope > header, :scope > footer, :scope > nav",
-              ),
-            ).filter((c) => !isFixedOrSticky(c));
-            if (directSemanticChildren.length > 0) {
-              results.push(...collectFromList(directSemanticChildren));
-              continue;
-            }
+        deriveSlugCandidate(el: Element, order: number): string {
+          const tag = el.tagName.toLowerCase();
+          if (el.id) {
+            const s = el.id.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+            if (s) return s;
           }
+          const aria = el.getAttribute("aria-label");
+          if (aria) {
+            const s = aria.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+            if (s) return s;
+          }
+          const heading = el.querySelector("h1,h2,h3,h4,h5,h6");
+          if (heading?.textContent) {
+            const s = heading.textContent.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+            if (s) return s;
+          }
+          return `${tag}-${order}`;
+        },
 
-          results.push({
-            tag: el.tagName.toLowerCase(),
-            slugCandidate: deriveSlugCandidate(el, order),
-            y,
-            height,
-          });
-          order++;
-        }
-        return results;
-      }
+        collectFromList(
+          list: Element[],
+        ): Array<{ tag: string; slugCandidate: string; role: string; description: string; y: number; height: number }> {
+          const results: Array<{ tag: string; slugCandidate: string; role: string; description: string; y: number; height: number }> = [];
+          let order = 1;
+          for (const el of list) {
+            if (h.isFixedOrSticky(el)) continue;
+            const rect = el.getBoundingClientRect();
+            const y = rect.top + window.scrollY;
+            const height = rect.height;
+            if (height < 50) continue;
+
+            if (height > tallThreshold) {
+              // Recursive descent: find direct semantic children (non-fixed/sticky)
+              const directSemanticChildren = Array.from(
+                el.querySelectorAll(
+                  ":scope > section, :scope > article, :scope > main, :scope > header, :scope > footer, :scope > nav",
+                ),
+              ).filter((c) => !h.isFixedOrSticky(c));
+              if (directSemanticChildren.length > 0) {
+                results.push(...h.collectFromList(directSemanticChildren));
+                continue;
+              }
+            }
+
+            // ── Role inference ────────────────────────────────────────────────
+            const tag = el.tagName.toLowerCase();
+            const ariaRole = el.getAttribute("role") ?? "";
+            const classList = Array.from(el.classList).join(" ").toLowerCase();
+            const idLower = (el.id ?? "").toLowerCase();
+            const combinedHint = `${tag} ${ariaRole} ${classList} ${idLower}`;
+
+            let role = tag;
+            if (tag === "nav" || /\bnav(bar|igation)?\b/.test(combinedHint)) role = "navbar";
+            else if (tag === "header" || /\bheader\b/.test(combinedHint)) role = "header";
+            else if (tag === "footer" || /\bfooter\b/.test(combinedHint)) role = "footer";
+            else if (/\bhero\b/.test(combinedHint)) role = "hero";
+            else if (/\bpric(e|ing)\b/.test(combinedHint)) role = "pricing";
+            else if (/\bfeature(s)?\b/.test(combinedHint)) role = "features";
+            else if (/\btestimoni(al|als|es)\b/.test(combinedHint)) role = "testimonials";
+            else if (/\bfaq\b/.test(combinedHint)) role = "faq";
+            else if (/\bcta\b|\bcall.to.action\b/.test(combinedHint)) role = "cta";
+            else if (/\bcontact\b/.test(combinedHint)) role = "contact";
+            else if (/\bteam\b/.test(combinedHint)) role = "team";
+            else if (/\bblog\b|\barticle\b/.test(combinedHint)) role = "blog";
+            else if (/\bgaller(y|ies)\b/.test(combinedHint)) role = "gallery";
+            else if (/\bbanner\b/.test(combinedHint)) role = "banner";
+
+            // ── Description from heading + lead text ─────────────────────────
+            const headingEl = el.querySelector("h1,h2,h3,h4,h5,h6");
+            const headingText = headingEl?.textContent?.trim().slice(0, 120) ?? "";
+            const paraEl = el.querySelector("p");
+            const paraText = paraEl?.textContent?.trim().slice(0, 160) ?? "";
+            const description = headingText
+              ? paraText
+                ? `${headingText} — ${paraText}`
+                : headingText
+              : paraText || `${role} section`;
+
+            results.push({
+              tag,
+              slugCandidate: h.deriveSlugCandidate(el, order),
+              role,
+              description,
+              y,
+              height,
+            });
+            order++;
+          }
+          return results;
+        },
+      };
 
       // Top-level semantic elements: those without a semantic ancestor
       const allSemantic = Array.from(document.querySelectorAll(SEMANTIC));
       const topLevel = allSemantic.filter((el) => !el.parentElement?.closest(SEMANTIC));
       const seed = topLevel.length > 0 ? topLevel : allSemantic;
-      return collectFromList(seed).sort((a, b) => a.y - b.y);
+      return h.collectFromList(seed).sort((a, b) => a.y - b.y);
     }, SECTION_TALL_THRESHOLD);
 
     // ── Deduplicate slugs and cap at MAX_SECTIONS ─────────────────────────────
@@ -219,13 +251,13 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
     // ── Screenshot each section ───────────────────────────────────────────────
     const sourceSectionScreenshots: Record<string, Buffer[]> = {};
     for (const sec of dedupedSections) {
-      const screenshots: Buffer[] = [];
+      const crops: Buffer[] = [];
       const clipY = Math.max(0, Math.min(sec.y, scrollHeight - VIEWPORT.height));
       const buf1 = await page.screenshot({
         type: "png",
         clip: { x: 0, y: clipY, width: VIEWPORT.width, height: VIEWPORT.height },
       });
-      screenshots.push(Buffer.from(buf1));
+      crops.push(Buffer.from(buf1));
 
       if (sec.height > SECTION_TALL_THRESHOLD) {
         const clipY2 = Math.max(
@@ -236,103 +268,36 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
           type: "png",
           clip: { x: 0, y: clipY2, width: VIEWPORT.width, height: VIEWPORT.height },
         });
-        screenshots.push(Buffer.from(buf2));
+        crops.push(Buffer.from(buf2));
       }
-      sourceSectionScreenshots[sec.slug] = screenshots;
+      sourceSectionScreenshots[sec.slug] = [stitchVertically(crops)];
     }
 
-    // ── VLM: enrich arch doc with descriptions and roles ─────────────────────
-    const userContent: Anthropic.MessageParam["content"] = [
-      {
-        type: "image",
-        source: { type: "base64", media_type: "image/png", data: screenshotBase64 },
-      },
-      { type: "text", text: "Full-page screenshot above. Now reviewing per-section screenshots:" },
-    ];
-
-    for (let i = 0; i < dedupedSections.length; i++) {
-      const sec = dedupedSections[i];
-      const imgs = sourceSectionScreenshots[sec.slug];
-      if (!imgs || imgs.length === 0) continue;
-      for (const buf of imgs) {
-        userContent.push({
-          type: "image",
-          source: { type: "base64", media_type: "image/png", data: buf.toString("base64") },
+    // ── Fixed/sticky elements for the arch doc ────────────────────────────────
+    const fixedElements = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll("*"))
+        .filter((el) => {
+          const pos = getComputedStyle(el).position;
+          return pos === "fixed" || pos === "sticky";
+        })
+        .slice(0, 10)
+        .map((el) => {
+          const tag = el.tagName.toLowerCase();
+          const role = el.getAttribute("role") ?? "";
+          const label = el.getAttribute("aria-label") ?? "";
+          const heading = el.querySelector("h1,h2,h3,h4,h5,h6")?.textContent?.trim().slice(0, 60) ?? "";
+          const hint = label || heading || el.id || Array.from(el.classList).slice(0, 3).join(" ");
+          return `${tag}${role ? `[role=${role}]` : ""}${hint ? ` — ${hint}` : ""}`;
         });
-      }
-      userContent.push({
-        type: "text",
-        text: `Section ${i + 1}: slug candidate "${sec.slug}" (${sec.tag}) — screenshot(s) above.`,
-      });
-    }
-    userContent.push({
-      type: "text",
-      text: `Produce the visual architecture document for these ${dedupedSections.length} sections. Respond with JSON only.`,
     });
 
-    // Fallback arch doc built from DOM data alone
-    let archDocSections: SectionSpec[] = dedupedSections.map((s, i) => ({
+    // ── Build arch doc from DOM data ──────────────────────────────────────────
+    const archDocSections: SectionSpec[] = dedupedSections.map((s, i) => ({
       slug: s.slug,
-      description: "",
-      role: s.tag,
+      description: s.description,
+      role: s.role,
       order: i + 1,
     }));
-    let fixedElements: string[] = [];
-    let backgroundDescription = "";
-
-    try {
-      const archResponse = await client.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 2048,
-        system: ARCH_DOC_SYSTEM,
-        messages: [{ role: "user", content: userContent }],
-      });
-
-      const text = archResponse.content.find((b) => b.type === "text")?.text ?? "";
-      const cleaned = text.replace(/^```[^\n]*\n?|```$/gm, "").trim();
-      const parsed = JSON.parse(cleaned) as {
-        fixedElements?: unknown;
-        backgroundDescription?: unknown;
-        sections?: Array<{ slug?: unknown; description?: unknown; role?: unknown }>;
-      };
-
-      if (Array.isArray(parsed.fixedElements)) {
-        fixedElements = (parsed.fixedElements as unknown[]).filter(
-          (s): s is string => typeof s === "string",
-        );
-      }
-      if (typeof parsed.backgroundDescription === "string") {
-        backgroundDescription = parsed.backgroundDescription;
-      }
-      if (Array.isArray(parsed.sections)) {
-        archDocSections = dedupedSections.map((s, i) => {
-          const vlmSection = (
-            parsed.sections as Array<{ slug?: unknown; description?: unknown; role?: unknown }>
-          )[i];
-          return {
-            slug:
-              typeof vlmSection?.slug === "string" && vlmSection.slug.trim()
-                ? vlmSection.slug.trim()
-                : s.slug,
-            description:
-              typeof vlmSection?.description === "string" ? vlmSection.description : "",
-            role: typeof vlmSection?.role === "string" ? vlmSection.role : s.tag,
-            order: i + 1,
-          };
-        });
-      }
-    } catch {
-      // VLM failed — fall back to DOM-derived info only
-    }
-
-    // Re-key screenshots to final (VLM-possibly-updated) slugs
-    const finalSectionScreenshots: Record<string, Buffer[]> = {};
-    for (let i = 0; i < dedupedSections.length; i++) {
-      const originalSlug = dedupedSections[i].slug;
-      const finalSlug = archDocSections[i]?.slug ?? originalSlug;
-      const imgs = sourceSectionScreenshots[originalSlug];
-      if (imgs) finalSectionScreenshots[finalSlug] = imgs;
-    }
 
     return {
       html,
@@ -343,8 +308,8 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
       imageUrls: extracted.uniqueImageUrls,
       fontFamilies: extracted.uniqueFontFamilies,
       svgs: extracted.svgs,
-      visualArchDoc: { sections: archDocSections, fixedElements, backgroundDescription },
-      sourceSectionScreenshots: finalSectionScreenshots,
+      visualArchDoc: { sections: archDocSections, fixedElements, backgroundDescription: "" },
+      sourceSectionScreenshots,
     };
   } finally {
     await browser.close();
