@@ -22,6 +22,8 @@ import { generateReport } from "./observability/report";
 import type { RunRecord, FidelityLevel, FidelityMode } from "./observability/types";
 
 const BASELINE_MODEL = "claude-haiku-4-5";
+const GENERATE_MODEL = "claude-sonnet-4-6";
+const FIX_MODEL = "claude-haiku-4-5";
 
 const client = new Anthropic();
 
@@ -233,8 +235,8 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
   const svgsText = context.svgs.join("\n");
 
   const runner = client.beta.messages.toolRunner({
-    model: "claude-haiku-4-5",
-    max_tokens: budget.generateMaxTokens ?? estimateMaxTokens(context.html.length, "claude-haiku-4-5"),
+    model: GENERATE_MODEL,
+    max_tokens: budget.generateMaxTokens ?? estimateMaxTokens(context.html.length, GENERATE_MODEL),
     tools: [saveFile],
     tool_choice: { type: "tool", name: "save_file" },
     stream: true,
@@ -301,7 +303,7 @@ ${context.html}
     phase: "generate",
     timestamp: Date.now(),
     data: {
-      model: "claude-haiku-4-5",
+      model: GENERATE_MODEL,
       tokensIn,
       tokensOut,
       durationMs: generateDurationMs,
@@ -309,8 +311,10 @@ ${context.html}
     },
   });
 
-  let totalTokensIn = tokensIn;
-  let totalTokensOut = tokensOut;
+  let generateTokensIn = tokensIn;
+  let generateTokensOut = tokensOut;
+  let fixTokensIn = 0;
+  let fixTokensOut = 0;
 
   // ─── Run record (hoisted — iterations populated by loop below) ──────────────
   const record: RunRecord = {
@@ -505,13 +509,13 @@ ${currentHtml}
       const fixStart = Date.now();
       const fixMaxTokens =
         level === "structure"
-          ? Math.max(budget.structureFixFloor ?? 40_960, estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"))
+          ? Math.max(budget.structureFixFloor ?? 40_960, estimateMaxTokens(currentHtml.length, FIX_MODEL))
           : level === "content"
-          ? (budget.contentFixMaxTokens ?? estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"))
-          : (budget.visualFixMaxTokens ?? estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"));
+          ? (budget.contentFixMaxTokens ?? estimateMaxTokens(currentHtml.length, FIX_MODEL))
+          : (budget.visualFixMaxTokens ?? estimateMaxTokens(currentHtml.length, FIX_MODEL));
 
       const fixRunner = client.beta.messages.toolRunner({
-        model: "claude-sonnet-4-6",
+        model: FIX_MODEL,
         max_tokens: fixMaxTokens,
         tools: [fixSaveFile],
         tool_choice: { type: "tool", name: "save_file" },
@@ -534,15 +538,15 @@ ${currentHtml}
 
       const { tokensIn: fixIn, tokensOut: fixOut } = await renderStream(fixRunner);
       const fixDurationMs = Date.now() - fixStart;
-      totalTokensIn += fixIn;
-      totalTokensOut += fixOut;
+      fixTokensIn += fixIn;
+      fixTokensOut += fixOut;
 
       logger.log({
         phase: "fix",
         timestamp: Date.now(),
         data: {
           iteration: i + 1,
-          model: "claude-sonnet-4-6",
+          model: FIX_MODEL,
           tokensIn: fixIn,
           tokensOut: fixOut,
           durationMs: fixDurationMs,
@@ -563,7 +567,9 @@ ${currentHtml}
 
   // ─── Cost + record finalisation ─────────────────────────────────────────────
   record.completedAt = Date.now();
-  record.estimatedCostUsd = estimateCost("claude-sonnet-4-6", totalTokensIn, totalTokensOut);
+  record.estimatedCostUsd =
+    estimateCost(GENERATE_MODEL, generateTokensIn, generateTokensOut) +
+    estimateCost(FIX_MODEL, fixTokensIn, fixTokensOut);
 
   let baselineSavedPath: string | null = null;
 
