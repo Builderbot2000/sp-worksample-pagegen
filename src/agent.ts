@@ -4,23 +4,18 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import { renderStream } from "./render";
-import { enrichContext } from "./context";
+import { crawlAndPreprocess } from "./context";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
 import { estimateCost, estimateMaxTokens, computeIterBudget } from "./observability/metrics";
 import {
   collectFidelityMetrics,
-  screenshotAndExtract,
-  computeChunkedVlmScore,
-  CHUNK_HARD_CAP,
+  screenshotSectionsBySlug,
+  computeSectionDiscrepancies,
   scoreSeverity,
-  captionDiscrepancies,
-  classifyLevel,
-  computeCompositeScore,
-  computeDomDiff,
 } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
-import type { RunRecord, FidelityLevel, FidelityMode, ChunkedVlmScore } from "./observability/types";
+import type { RunRecord, FidelityMode, IterationRecord, VisualArchDoc } from "./observability/types";
 
 const BASELINE_MODEL = "claude-haiku-4-5";
 const GENERATE_MODEL = "claude-sonnet-4-6";
@@ -33,35 +28,20 @@ const client = new Anthropic();
 export interface FidelityBudget {
   minIterations: number;
   maxIterations: number;
-  /** Headings per structure-level fix pass. undefined = no structure passes. */
-  structureBatchSize: number | undefined;
   /** Hard cap for initial generation. null = use estimateMaxTokens() dynamically. */
   generateMaxTokens: number | null;
-  /**
-   * Floor for structure fix pass max_tokens. Actual value =
-   * Math.max(structureFixFloor, estimateMaxTokens(currentHtml.length, model)).
-   * undefined = no structure passes (minimal mode).
-   */
-  structureFixFloor: number | undefined;
-  /** null = use estimateMaxTokens() dynamically. */
-  contentFixMaxTokens: number | null;
-  /** null = use estimateMaxTokens() dynamically. */
-  visualFixMaxTokens: number | null;
-  captionMaxTokens: number;
-  useWideViewport: boolean;
-  /**
-   * Multiplier applied to (scrollHeight / viewportHeight) to determine how
-   * many heading-anchored VLM chunks to use. 0 = use fold only (1 chunk).
-   */
-  vlmChunkMultiplier: number;
+  /** Max tokens for Haiku full-document rewrite. null = use estimateMaxTokens() dynamically. */
+  patchMaxTokens: number | null;
+  /** Max tokens for the section VLM comparison call. */
+  sectionVlmMaxTokens: number;
 }
 
 const FIDELITY_BUDGETS: Record<FidelityMode, FidelityBudget> = {
-  minimal:  { minIterations: 0,  maxIterations: 0,  structureBatchSize: undefined, generateMaxTokens: 8_000,  structureFixFloor: undefined, contentFixMaxTokens: null,   visualFixMaxTokens: null,   captionMaxTokens: 1_024, useWideViewport: false, vlmChunkMultiplier: 0   },
-  fast:     { minIterations: 2,  maxIterations: 3,  structureBatchSize: 10,        generateMaxTokens: 12_000, structureFixFloor: 24_576,   contentFixMaxTokens: 32_768, visualFixMaxTokens: 24_576, captionMaxTokens: 512,   useWideViewport: false, vlmChunkMultiplier: 0.4 },
-  balanced: { minIterations: 3,  maxIterations: 6,  structureBatchSize: 15,        generateMaxTokens: null,   structureFixFloor: 40_960,   contentFixMaxTokens: null,   visualFixMaxTokens: null,   captionMaxTokens: 1_024, useWideViewport: true,  vlmChunkMultiplier: 0.6 },
-  high:     { minIterations: 4,  maxIterations: 8,  structureBatchSize: 20,        generateMaxTokens: null,   structureFixFloor: 49_152,   contentFixMaxTokens: 65_536, visualFixMaxTokens: 65_536, captionMaxTokens: 1_024, useWideViewport: true,  vlmChunkMultiplier: 0.8 },
-  maximal:  { minIterations: 6,  maxIterations: 12, structureBatchSize: 30,        generateMaxTokens: null,   structureFixFloor: 57_344,   contentFixMaxTokens: 65_536, visualFixMaxTokens: 65_536, captionMaxTokens: 2_048, useWideViewport: true,  vlmChunkMultiplier: 1.0 },
+  minimal:  { minIterations: 0,  maxIterations: 0,  generateMaxTokens: 8_000,  patchMaxTokens: null,   sectionVlmMaxTokens: 512   },
+  fast:     { minIterations: 2,  maxIterations: 3,  generateMaxTokens: 12_000, patchMaxTokens: 32_768, sectionVlmMaxTokens: 512   },
+  balanced: { minIterations: 3,  maxIterations: 6,  generateMaxTokens: null,   patchMaxTokens: null,   sectionVlmMaxTokens: 1_024 },
+  high:     { minIterations: 4,  maxIterations: 8,  generateMaxTokens: null,   patchMaxTokens: 65_536, sectionVlmMaxTokens: 1_024 },
+  maximal:  { minIterations: 6,  maxIterations: 12, generateMaxTokens: null,   patchMaxTokens: 65_536, sectionVlmMaxTokens: 2_048 },
 };
 
 const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
@@ -69,7 +49,6 @@ const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
 export interface GenerateOptions {
   name?: string;
   fidelity?: FidelityMode;
-  threshold?: number;
   baseline?: boolean;
   open?: boolean;
 }
@@ -90,15 +69,16 @@ function urlSlug(url: string): string {
   }
 }
 
-async function fetchPage(url: string): Promise<{ html: string; truncated: boolean }> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
-  const sourceHtml = await res.text();
-  const maxChars = 80_000;
-  if (sourceHtml.length > maxChars) {
-    return { html: sourceHtml.slice(0, maxChars) + "\n<!-- truncated -->", truncated: true };
-  }
-  return { html: sourceHtml, truncated: false };
+function formatArchDoc(archDoc: VisualArchDoc): string {
+  const sectionsText = archDoc.sections
+    .map((s) => `  ${s.order}. slug: "${s.slug}" | role: ${s.role}\n     ${s.description}`)
+    .join("\n");
+  const fixedText =
+    archDoc.fixedElements.length > 0 ? archDoc.fixedElements.join("; ") : "None";
+  return `Background: ${archDoc.backgroundDescription}
+Fixed/sticky elements: ${fixedText}
+Sections (in visual order):
+${sectionsText}`;
 }
 
 async function runBaseline(
@@ -197,23 +177,21 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     },
   });
 
-  const context = await enrichContext(url);
+  const crawlResult = await crawlAndPreprocess(url);
+  const archDoc = crawlResult.visualArchDoc;
 
   const budget = FIDELITY_BUDGETS[opts.fidelity ?? "balanced"];
-  const sourceHeadings = context.domInfo.headings.length;
-  const { resolvedMaxIter, rawBudget } = computeIterBudget(sourceHeadings, budget);
+  const sectionCount = archDoc.sections.length;
+  const { resolvedMaxIter, rawBudget } = computeIterBudget(sectionCount, budget);
 
   if (budget.maxIterations > 0 && rawBudget > budget.maxIterations) {
     const fidelityMode = opts.fidelity ?? "balanced";
     const modeOrder: FidelityMode[] = ["fast", "balanced", "high", "maximal"];
     const nextMode = modeOrder[modeOrder.indexOf(fidelityMode as FidelityMode) + 1];
-    const structPasses = resolvedMaxIter - 2;
-    const coveredHeadings = structPasses * (budget.structureBatchSize ?? 0);
-    const requiredHeadings = Math.ceil(sourceHeadings * 0.8);
-    const pct = Math.round((coveredHeadings / requiredHeadings) * 100);
+    const pct = Math.round((resolvedMaxIter / rawBudget) * 100);
     const suggestion = nextMode ? ` Consider --fidelity ${nextMode}.` : "";
     console.warn(
-      `[budget] Site has ${sourceHeadings} headings; ${fidelityMode} mode will cover ~${coveredHeadings}/${requiredHeadings} structure sections (~${pct}%).${suggestion}`,
+      `[budget] Site has ${sectionCount} sections; ${fidelityMode} mode covers ~${pct}% of raw budget (${resolvedMaxIter}/${rawBudget} iterations).${suggestion}`,
     );
   }
 
@@ -222,12 +200,12 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     timestamp: Date.now(),
     data: {
       url,
-      htmlBytes: context.html.length,
-      truncated: context.truncated,
+      htmlBytes: crawlResult.html.length,
+      truncated: crawlResult.truncated,
       enriched: true,
-      imageCount: context.imageUrls.length,
-      fontCount: context.fontFamilies.length,
-      sourceHeadings,
+      imageCount: crawlResult.imageUrls.length,
+      fontCount: crawlResult.fontFamilies.length,
+      sectionCount,
       resolvedMaxIter,
       fidelityMode: opts.fidelity ?? "balanced",
     },
@@ -235,19 +213,26 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
 
   const generateStart = Date.now();
 
-  const stylesJson = JSON.stringify(context.computedStyles, null, 2);
-  const fontsText = context.fontFamilies.join(", ");
-  const imageUrlsText = context.imageUrls.join("\n");
-  const svgsText = context.svgs.join("\n");
+  const stylesJson = JSON.stringify(crawlResult.computedStyles, null, 2);
+  const fontsText = crawlResult.fontFamilies.join(", ");
+  const imageUrlsText = crawlResult.imageUrls.join("\n");
+  const svgsText = crawlResult.svgs.join("\n");
+  const archDocText = formatArchDoc(archDoc);
 
   const runner = client.beta.messages.toolRunner({
     model: GENERATE_MODEL,
-    max_tokens: budget.generateMaxTokens ?? estimateMaxTokens(context.html.length, GENERATE_MODEL),
+    max_tokens: budget.generateMaxTokens ?? estimateMaxTokens(crawlResult.html.length, GENERATE_MODEL),
     tools: [saveFile],
     tool_choice: { type: "tool", name: "save_file" },
     stream: true,
     max_iterations: 1,
-    system: `You are an expert front-end developer that generates pixel-faithful HTML pages from source pages.`,
+    system: `You are an expert front-end developer that generates pixel-faithful HTML pages from source pages.
+
+CRITICAL: The visual architecture specification in the user message defines the sections that MUST appear in your output. Every section's outermost element MUST have these two attributes exactly:
+  data-section-slug="<slug>"   (must match the slug from the spec verbatim)
+  data-section-order="<N>"     (integer 1-based order from the spec)
+
+These attributes are mandatory — the correction system identifies and scores sections solely by them.`,
     messages: [
       {
         role: "user",
@@ -257,7 +242,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
             source: {
               type: "base64",
               media_type: "image/png",
-              data: context.screenshotBase64,
+              data: crawlResult.screenshotBase64,
             },
           },
           {
@@ -277,6 +262,17 @@ The page MUST:
   - The reference screenshot is captured at 1280px; ensure nothing is broken or unnaturally stretched beyond that
 - Use descriptive kebab-case filename based on the source page's title or domain
 
+SECTION LABELS (hard constraint):
+The visual architecture doc below defines the required sections for this page.
+For every section listed, its outermost root element MUST carry these two attributes:
+  data-section-slug="<slug>"    (must match exactly)
+  data-section-order="<order>"  (integer, 1-based)
+The correction system identifies and scores sections solely by these attributes.
+
+<visual_architecture>
+${archDocText}
+</visual_architecture>
+
 <computed_styles>
 ${stylesJson}
 </computed_styles>
@@ -294,7 +290,7 @@ ${svgsText}
 </svgs>
 
 <source_html>
-${context.html}
+${crawlResult.html}
 </source_html>`,
           },
         ],
@@ -335,120 +331,58 @@ ${context.html}
 
   // ─── Iterative fidelity loop ────────────────────────────────────────────────
   const MAX_ITER = resolvedMaxIter;
-  const CONV_THRESHOLD = opts.threshold ?? 0.02;
-  const sourceFoldBase64 = context.screenshotFoldBase64;
-  const sourceBase64 = context.screenshotBase64;
-  const sourceWideBase64 = context.screenshotWideBase64;
-  const sourceChunks = context.screenshotChunksBase64;
-  const sourceScrollHeight = context.scrollHeight;
-  const sourceDomInfo = context.domInfo;
-  let prevCompositeScore: number | null = null;
 
   if (savedPath) {
     for (let i = 0; i < MAX_ITER; i++) {
-      console.log(`\n[fidelity] Iteration ${i + 1}/${MAX_ITER} — scoring...`);
+      console.log(`\n[fidelity] Iteration ${i + 1}/${MAX_ITER} — scoring sections...`);
 
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      const { screenshot: genBuf, screenshotFold: genFoldBuf, screenshotWide: genWideBuf, screenshotChunks: genChunksBuf, domInfo: genDomInfo } =
-        await screenshotAndExtract(
-          { file: savedPath! },
-          {
-            useWideViewport: budget.useWideViewport,
-            // Drive gen chunk capture from source heading texts so chunk labels
-            // are identical on both sides and fuzzy-match failures can't cause
-            // present sections to be scored as absent.
-            targetHeadings: sourceChunks
-              .map((c) => c.heading)
-              .filter((h) => h !== "FOLD"),
-          },
-        );
-      const genBase64 = genBuf.toString("base64");
-      const genFoldBase64 = genFoldBuf.toString("base64");
-      const genWideBase64 = genWideBuf.toString("base64");
-      const genChunks = genChunksBuf.map((c) => ({ heading: c.heading, screenshot: c.screenshot.toString("base64") }));
-
-      // ── How many chunks to score this iteration ───────────────────────────
-      // Dynamic: scale by (scrollHeight / viewportHeight) * mode multiplier,
-      // clamped to [1, CHUNK_HARD_CAP]. 0 multiplier (minimal mode) → 1 chunk.
-      const VIEWPORT_H = 900;
-      const maxChunks = budget.vlmChunkMultiplier === 0
-        ? 1
-        : Math.max(1, Math.min(CHUNK_HARD_CAP, Math.ceil((sourceScrollHeight / VIEWPORT_H) * budget.vlmChunkMultiplier)));
-
-      // ── Level classification via DOM diff (no VLM cost) ──────────────────
-      const domDiff = computeDomDiff(sourceDomInfo, genDomInfo);
-      const level: FidelityLevel = classifyLevel(domDiff);
-
-      // ── VLM scoring only at visual level (chunk-based for coverage) ──────
-      let chunkedVlm: ChunkedVlmScore | null = null;
-      let severity: "high" | "medium" | "low" = "high";
-      if (level === "visual") {
-        chunkedVlm = await computeChunkedVlmScore(sourceChunks, genChunks, maxChunks);
-        severity = scoreSeverity(chunkedVlm.aggregateScore);
-      }
-
-      const compositeScore =
-        level === "visual" && chunkedVlm !== null
-          ? computeCompositeScore(chunkedVlm.aggregateScore, domDiff.score)
-          : domDiff.score;
+      const genSections = await screenshotSectionsBySlug({ file: savedPath! }, archDoc);
+      const { discrepancies, matched, unmatched, aggregateScore } = await computeSectionDiscrepancies(
+        crawlResult.sourceSectionScreenshots,
+        genSections,
+        archDoc,
+        { maxTokens: budget.sectionVlmMaxTokens },
+      );
+      const severity = scoreSeverity(aggregateScore);
 
       logger.log({
         phase: "diff",
         timestamp: Date.now(),
-        data: {
-          iteration: i + 1,
-          vlmScore: chunkedVlm?.aggregateScore ?? 0,
-          vlmVerdict: chunkedVlm?.aggregateVerdict ?? "distant",
-          level,
-          domScore: domDiff.score,
-          compositeScore,
-        },
+        data: { iteration: i + 1, vlmScore: aggregateScore, matched, unmatched, discrepancyCount: discrepancies.length },
       });
 
-      const iterRecord = {
+      const iterRecord: IterationRecord = {
         iteration: i + 1,
-        level,
-        vlmScore: chunkedVlm?.aggregateScore ?? 0,
-        vlmVerdict: chunkedVlm?.aggregateVerdict ?? "distant",
-        domScore: domDiff.score,
-        compositeScore,
+        matched,
+        unmatched,
+        vlmScore: aggregateScore,
         severity,
-        discrepancyCount: 0,
-        ...(chunkedVlm ? { vlmChunks: chunkedVlm.chunks } : {}),
+        discrepancyCount: discrepancies.length,
       };
 
       console.log(
-        `[fidelity] Level: ${level} | DOM: ${domDiff.score.toFixed(3)} (hr=${domDiff.headingRetentionRatio.toFixed(2)} tc=${domDiff.textCoverageRatio.toFixed(2)})` +
-          (level === "visual" && chunkedVlm
-            ? ` | VLM: ${chunkedVlm.aggregateScore.toFixed(3)} (${severity}) [${chunkedVlm.chunks.length} chunks]`
-            : "") +
-          ` | Composite: ${compositeScore.toFixed(3)}`,
+        `[fidelity] ${matched}/${matched + unmatched} sections matched | VLM: ${aggregateScore.toFixed(3)} (${severity}) | ${discrepancies.length} discrepancies`,
       );
 
-      // ── Convergence checks ────────────────────────────────────────────────
-      if (level === "visual" && severity === "low") {
-        console.log("[fidelity] Severity low — converged, stopping loop.");
+      if (discrepancies.length === 0) {
+        console.log("[fidelity] No discrepancies — converged.");
         record.iterations.push(iterRecord);
         break;
       }
 
-      if (prevCompositeScore !== null && Math.abs(compositeScore - prevCompositeScore) < CONV_THRESHOLD) {
-        console.log("[fidelity] Composite score delta below threshold — converged, stopping loop.");
-        record.iterations.push(iterRecord);
-        break;
-      }
+      record.iterations.push(iterRecord);
 
-      // ── Fix pass ──────────────────────────────────────────────────────────
+      // ── Patch pass ────────────────────────────────────────────────────────
       const currentFilePath = savedPath!;
       const currentHtml = fs.readFileSync(currentFilePath, "utf-8");
       savedPath = null;
 
       const fixSaveFile = betaZodTool({
         name: "save_file",
-        description: "Save the fixed HTML page to disk.",
+        description: "Save the rewritten HTML page to disk.",
         inputSchema: z.object({
           filename: z.string().describe("Same kebab-case filename as the original."),
-          content: z.string().describe("The complete fixed HTML content of the page."),
+          content: z.string().describe("The complete rewritten HTML content of the page."),
         }),
         run: async (input) => {
           const outPath = path.join(mainDir, input.filename);
@@ -458,110 +392,34 @@ ${context.html}
         },
       });
 
-      let fixSystem: string;
-      let fixUserText: string;
-      let fixImageBase64: string;
-
-      const STRUCTURE_BATCH = budget.structureBatchSize ?? 15;
-      if (level === "structure") {
-        const batch = domDiff.missingHeadings.slice(0, STRUCTURE_BATCH);
-        const missingList = batch.join("\n");
-        const remaining = domDiff.missingHeadings.length - batch.length;
-        console.log(`[fidelity] Structure pass — adding ${batch.length} of ${domDiff.missingHeadings.length} missing headings (${remaining} remaining)`);
-        fixSystem = `You are an expert front-end developer completing a partially-generated HTML page. Your ONLY task is to add the missing sections listed below in the correct order. Do NOT change any section that already exists. Use responsive Tailwind classes (max-w-* mx-auto, xl:/2xl: variants).`;
-        fixImageBase64 = sourceFoldBase64;
-        fixUserText = `The image above is the SOURCE page first fold. The HTML below is missing these sections — add them in the order they appear on the source page:
-
-<missing_sections>
-${missingList}
-</missing_sections>
-
-<current_html>
-${currentHtml}
-</current_html>`;
-        iterRecord.discrepancyCount = domDiff.missingHeadings.length;
-      } else if (level === "content") {
-        // Level 2: fill copy and images into existing skeleton
-        console.log(
-          `[fidelity] Content pass — text coverage ${(domDiff.textCoverageRatio * 100).toFixed(0)}%, image delta ${domDiff.imageDelta}`,
-        );
-        fixSystem = `You are an expert front-end developer filling in missing content in a generated HTML page. Your ONLY task is to add missing copy and images. Do NOT change the layout, colours, or visual styling.`;
-        fixImageBase64 = sourceBase64;
-        fixUserText = `The image above is the full SOURCE page. The HTML below has the right structure but is missing content:
-- Text coverage: ${(domDiff.textCoverageRatio * 100).toFixed(0)}% of source (target ≥70%)
-- Image delta: ${domDiff.imageDelta} (negative = missing images)
-
-Add missing body copy and images to match the source. Do not touch layout or styling.
-
-<current_html>
-${currentHtml}
-</current_html>`;
-        iterRecord.discrepancyCount = Math.round((1 - domDiff.textCoverageRatio) * 10);
-      } else {
-        // Level 3: visual fix using VLM discrepancy list
-        console.log(`[fidelity] Captioning discrepancies...`);
-        const discrepancies = await captionDiscrepancies(
-          sourceFoldBase64,
-          genFoldBase64,
-          budget.useWideViewport ? { sourceWideBase64, generatedWideBase64: genWideBase64 } : undefined,
-          { maxTokens: budget.captionMaxTokens },
-        );
-        iterRecord.discrepancyCount = discrepancies.length;
-
-        logger.log({
-          phase: "caption",
-          timestamp: Date.now(),
-          data: { iteration: i + 1, tokensIn: 0, tokensOut: 0, discrepancies },
-        });
-
-        if (discrepancies.length === 0) {
-          console.log("[fidelity] No actionable discrepancies — stopping loop.");
-          record.iterations.push(iterRecord);
-          break;
-        }
-
-        console.log(`[fidelity] ${discrepancies.length} discrepancies — visual fix pass...`);
-        const discrepancyList = discrepancies.map((d) => `[${d.severity}] ${d.section}: ${d.issue}`).join("\n");
-        fixSystem = `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. You will be shown the source page screenshot and a list of specific discrepancies. Fix ONLY the listed issues — do not modify sections that are already correct. All fixes must use responsive Tailwind classes that render correctly from 1280px through 2560px+; never use fixed pixel widths on containers.`;
-        fixImageBase64 = sourceFoldBase64;
-        fixUserText = `The image above is the SOURCE page you must match. The HTML below is the current reconstruction. Fix ONLY the discrepancies listed — do not change anything else.
-
-<discrepancies>
-${discrepancyList}
-</discrepancies>
-
-<current_html>
-${currentHtml}
-</current_html>`;
-      }
-
-      record.iterations.push(iterRecord);
+      const discrepancyList = discrepancies
+        .map((d) => {
+          const spec = archDoc.sections.find((s) => s.slug === d.slug);
+          return `[${d.severity}] ${d.slug} (${spec?.role ?? "section"}): ${d.issues.join("; ")}`;
+        })
+        .join("\n");
 
       const fixStart = Date.now();
-      const fixMaxTokens =
-        level === "structure"
-          ? Math.max(budget.structureFixFloor ?? 40_960, estimateMaxTokens(currentHtml.length, FIX_MODEL))
-          : level === "content"
-          ? (budget.contentFixMaxTokens ?? estimateMaxTokens(currentHtml.length, FIX_MODEL))
-          : (budget.visualFixMaxTokens ?? estimateMaxTokens(currentHtml.length, FIX_MODEL));
-
       const fixRunner = client.beta.messages.toolRunner({
         model: FIX_MODEL,
-        max_tokens: fixMaxTokens,
+        max_tokens: budget.patchMaxTokens ?? estimateMaxTokens(currentHtml.length, FIX_MODEL),
         tools: [fixSaveFile],
         tool_choice: { type: "tool", name: "save_file" },
         stream: true,
         max_iterations: 1,
-        system: fixSystem,
+        system: `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. Rewrite the complete HTML document fixing the listed discrepancies. Preserve sections that are already correct. All sections MUST keep their data-section-slug and data-section-order attributes.`,
         messages: [
           {
             role: "user",
             content: [
               {
                 type: "image",
-                source: { type: "base64", media_type: "image/png", data: fixImageBase64 },
+                source: { type: "base64", media_type: "image/png", data: crawlResult.screenshotBase64 },
               },
-              { type: "text", text: fixUserText },
+              {
+                type: "text",
+                text: `SOURCE page above.\n\n<visual_architecture>\n${archDocText}\n</visual_architecture>\n\n<discrepancies>\n${discrepancyList}\n</discrepancies>\n\nRewrite the complete HTML fixing the listed discrepancies. Each section root MUST carry its data-section-slug and data-section-order attributes.\n\n<current_html>\n${currentHtml}\n</current_html>`,
+              },
             ],
           },
         ],
@@ -591,8 +449,6 @@ ${currentHtml}
         console.log("[fidelity] Fix pass did not save a file — stopping loop.");
         break;
       }
-
-      prevCompositeScore = compositeScore;
     }
   }
 
@@ -607,7 +463,7 @@ ${currentHtml}
   if (opts.baseline) {
     const baselineDir = path.join(runDir, "baseline");
     console.log("\n[baseline] Running baseline agent...");
-    const bl = await runBaseline(url, baselineDir, context.html);
+    const bl = await runBaseline(url, baselineDir, crawlResult.html);
     baselineSavedPath = bl.savedPath;
     record.baseline = {
       baselineScore: 0,
@@ -626,7 +482,8 @@ ${currentHtml}
     console.log("\n[fidelity] Computing final fidelity metrics...");
     try {
       const fidelity = await collectFidelityMetrics(
-        url,
+        { screenshotBase64: crawlResult.screenshotBase64, sectionScreenshots: crawlResult.sourceSectionScreenshots },
+        archDoc,
         savedPath,
         baselineSavedPath ?? undefined,
       );

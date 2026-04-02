@@ -22,7 +22,6 @@ const program = new Command()
       return v as FidelityMode;
     },
   )
-  .option("--threshold <n>", "Convergence score threshold", (v) => parseFloat(v), 0.02)
   .option("--baseline", "Also run the baseline agent for comparison")
   .option("--open", "Open the generated file in the default browser")
   .action(async (url: string, opts: GenerateOptions & { open?: boolean }) => {

@@ -2,13 +2,35 @@
 
 export type Severity = "high" | "medium" | "low";
 
-// ─── Fidelity level ───────────────────────────────────────────────────────────
-
-export type FidelityLevel = "structure" | "content" | "visual";
-
 // ─── Fidelity mode ────────────────────────────────────────────────────────────
 
 export type FidelityMode = "minimal" | "fast" | "balanced" | "high" | "maximal";
+
+// ─── Visual architecture ──────────────────────────────────────────────────────
+
+export interface SectionSpec {
+  slug: string;
+  description: string;
+  role: string;
+  order: number;
+}
+
+export interface VisualArchDoc {
+  sections: SectionSpec[];
+  fixedElements: string[];
+  backgroundDescription: string;
+}
+
+// ─── Section discrepancy ─────────────────────────────────────────────────────
+
+export interface SectionDiscrepancy {
+  slug: string;
+  type: "missing" | "visual";
+  severity: "high" | "medium";
+  issues: string[];
+  relativePosition?: number;
+  score?: number;
+}
 
 // ─── Phase data interfaces ────────────────────────────────────────────────────
 
@@ -19,7 +41,7 @@ export interface FetchData {
   enriched?: boolean;
   imageCount?: number;
   fontCount?: number;
-  sourceHeadings?: number;
+  sectionCount?: number;
   resolvedMaxIter?: number;
   fidelityMode?: FidelityMode;
 }
@@ -41,17 +63,9 @@ export interface ScreenshotData {
 export interface DiffData {
   iteration: number;
   vlmScore: number;
-  vlmVerdict: VlmVerdict;
-  level?: FidelityLevel;
-  domScore?: number;
-  compositeScore?: number;
-}
-
-export interface CaptionData {
-  iteration: number;
-  tokensIn: number;
-  tokensOut: number;
-  discrepancies: Array<{ issue: string; severity: Severity }>;
+  matched: number;
+  unmatched: number;
+  discrepancyCount: number;
 }
 
 export interface FixData {
@@ -70,21 +84,17 @@ export type LogLine =
   | { phase: "generate"; timestamp: number; data: GenerateData }
   | { phase: "screenshot"; timestamp: number; data: ScreenshotData }
   | { phase: "diff"; timestamp: number; data: DiffData }
-  | { phase: "caption"; timestamp: number; data: CaptionData }
   | { phase: "fix"; timestamp: number; data: FixData };
 
 // ─── Run records ─────────────────────────────────────────────────────────────
 
 export interface IterationRecord {
   iteration: number;
-  level: FidelityLevel;
+  matched: number;
+  unmatched: number;
   vlmScore: number;
-  vlmVerdict: VlmVerdict;
-  domScore: number;
-  compositeScore: number;
   severity: Severity;
   discrepancyCount: number;
-  vlmChunks?: VlmChunkScore[];
 }
 
 export interface BaselineComparison {
@@ -100,32 +110,7 @@ export interface BaselineComparison {
 
 // ─── Fidelity metrics ────────────────────────────────────────────────────────
 
-export interface DomInfo {
-  headings: Array<{ tag: string; text: string; y: number }>;
-  paragraphs: number;
-  images: number;
-  buttons: number;
-  sections: number;
-  links: number;
-  totalTextLength: number;
-}
-
 export type VlmVerdict = "close" | "partial" | "distant";
-
-// ─── Chunked VLM scoring ─────────────────────────────────────────────────────
-
-export interface VlmChunkScore {
-  heading: string;
-  score: number;
-  verdict: VlmVerdict;
-  issues: string[];
-}
-
-export interface ChunkedVlmScore {
-  chunks: VlmChunkScore[];
-  aggregateScore: number;
-  aggregateVerdict: VlmVerdict;
-}
 
 export interface VlmFidelityScore {
   verdict: VlmVerdict;
@@ -134,25 +119,12 @@ export interface VlmFidelityScore {
   issues: string[];
 }
 
-export interface DomDiffResult {
-  missingHeadings: string[];
-  extraHeadings: string[];
-  imageDelta: number;
-  buttonDelta: number;
-  sectionDelta: number;
-  textCoverageRatio: number;
-  headingRetentionRatio: number;
-  score: number;
-}
-
 export interface FidelityMetrics {
   sourceScreenshotBase64: string;
   mainScreenshotBase64: string;
   baselineScreenshotBase64?: string;
   mainVlmScore: VlmFidelityScore;
   baselineVlmScore?: VlmFidelityScore;
-  mainDomDiff: DomDiffResult;
-  baselineDomDiff?: DomDiffResult;
 }
 
 // ─── Run record ───────────────────────────────────────────────────────────────

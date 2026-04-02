@@ -31,13 +31,7 @@ export function estimateCost(
   );
 }
 
-export function checkConvergence(
-  prevScore: number,
-  currScore: number,
-  threshold: number,
-): boolean {
-  return Math.abs(currScore - prevScore) < threshold;
-}
+
 
 // \u2500\u2500\u2500 Iteration budget \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
@@ -45,22 +39,20 @@ import type { FidelityBudget } from "../agent";
 
 /**
  * Compute the resolved iteration count for a run, scaled to the source page's
- * heading count, clamped within the mode's min/max range.
+ * section count, clamped within the mode's min/max range.
  *
  * Formula:
- *   structPassesNeeded = ceil(headingCount * 0.8 / structureBatchSize)
- *   rawBudget          = structPassesNeeded + 2  (+1 content, +1 visual minimum)
- *   resolvedMaxIter    = clamp(rawBudget, minIterations, maxIterations)
+ *   rawBudget       = ceil(sectionCount * 0.5) + 1
+ *   resolvedMaxIter = clamp(rawBudget, minIterations, maxIterations)
  */
 export function computeIterBudget(
-  headingCount: number,
+  sectionCount: number,
   budget: FidelityBudget,
 ): { resolvedMaxIter: number; rawBudget: number } {
-  if (budget.maxIterations === 0 || budget.structureBatchSize === undefined) {
+  if (budget.maxIterations === 0) {
     return { resolvedMaxIter: 0, rawBudget: 0 };
   }
-  const structPassesNeeded = Math.ceil((headingCount * 0.8) / budget.structureBatchSize);
-  const rawBudget = structPassesNeeded + 2;
+  const rawBudget = Math.ceil(sectionCount * 0.5) + 1;
   const resolvedMaxIter = Math.max(
     budget.minIterations,
     Math.min(budget.maxIterations, rawBudget),

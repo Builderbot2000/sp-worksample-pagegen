@@ -51,24 +51,21 @@ function buildIterationRows(record: RunRecord): string {
     .map((iter: IterationRecord) => {
       const color = severityColor(iter.severity);
       const barWidth = scoreBarWidth(iter.vlmScore);
-      const levelColor =
-        iter.level === "structure" ? "#3b82f6" : iter.level === "content" ? "#f59e0b" : "#22c55e";
+      const matchedColor = iter.unmatched === 0 ? "#22c55e" : "#f59e0b";
       return `
       <tr>
         <td style="padding:0.6rem 1rem;text-align:center;font-variant-numeric:tabular-nums">${iter.iteration}</td>
-        <td style="padding:0.6rem 1rem;text-align:center">
-          <span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:4px;background:${levelColor}22;color:${levelColor};font-size:0.75rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">${iter.level}</span>
-        </td>
+        <td style="padding:0.6rem 1rem;text-align:center;color:#22c55e;font-weight:600">${iter.matched}</td>
+        <td style="padding:0.6rem 1rem;text-align:center;color:${matchedColor};font-weight:600">${iter.unmatched}</td>
         <td style="padding:0.6rem 1rem">
           <div style="display:flex;align-items:center;gap:0.5rem">
             <div style="flex:1;background:#111827;border-radius:3px;height:8px;overflow:hidden">
               <div style="width:${barWidth}%;height:100%;background:${color};border-radius:3px"></div>
             </div>
-            <span style="font-variant-numeric:tabular-nums;font-size:0.875rem;color:${color}">${iter.compositeScore.toFixed(3)}</span>
+            <span style="font-variant-numeric:tabular-nums;font-size:0.875rem;color:${color}">${iter.vlmScore.toFixed(3)}</span>
           </div>
         </td>
         <td style="padding:0.6rem 1rem;color:${color};font-weight:600;font-size:0.875rem">${iter.severity}</td>
-        <td style="padding:0.6rem 1rem;font-size:0.875rem;color:#9ca3af">${iter.vlmVerdict}</td>
         <td style="padding:0.6rem 1rem;text-align:center;font-size:0.875rem;color:#9ca3af">${iter.discrepancyCount}</td>
       </tr>`;
     })
@@ -294,76 +291,10 @@ function buildFidelitySection(fidelity: FidelityMetrics): string {
     ${baselineRow}
   </div>`;
 
-  // ── DOM diff panel ────────────────────────────────────────────────────────
-  function deltaLabel(n: number): string {
-    return n === 0
-      ? `<span style="color:#6b7280">0</span>`
-      : n > 0
-        ? `<span style="color:#f59e0b">+${n}</span>`
-        : `<span style="color:#ef4444">${n}</span>`;
-  }
-
-  function pct(r: number): string {
-    return `<span style="color:${scoreColor(r)}">${(r * 100).toFixed(1)}%</span>`;
-  }
-
-  const md = fidelity.mainDomDiff;
-  const bd = fidelity.baselineDomDiff;
-
-  const thStyle =
-    "text-align:left;padding:0.5rem 0.75rem;font-size:0.7rem;font-weight:600;color:#6b7280;text-transform:uppercase;border-bottom:1px solid #374151";
-  const tdStyle = "padding:0.5rem 0.75rem;font-size:0.8rem;color:#d1d5db;border-bottom:1px solid #1f2937";
-
-  const hasBaseline = bd !== undefined;
-  const colHeader = hasBaseline
-    ? `<th style="${thStyle}">Experimental</th><th style="${thStyle}">Baseline</th>`
-    : `<th style="${thStyle}">Experimental</th>`;
-
-  function row(label: string, main: string, baseline?: string): string {
-    const baselineCell = hasBaseline
-      ? `<td style="${tdStyle}">${baseline ?? "—"}</td>`
-      : "";
-    return `<tr><td style="${tdStyle};color:#9ca3af">${label}</td><td style="${tdStyle}">${main}</td>${baselineCell}</tr>`;
-  }
-
-  const missingHeadingsMain =
-    md.missingHeadings.length > 0
-      ? `<details style="display:inline"><summary style="cursor:pointer;color:#ef4444;font-size:0.75rem">${md.missingHeadings.length} missing</summary><div style="font-size:0.7rem;color:#9ca3af;max-width:300px;white-space:normal">${md.missingHeadings.slice(0, 10).map(escapeHtml).join("<br>")}</div></details>`
-      : `<span style="color:#22c55e">None</span>`;
-
-  const missingHeadingsBase =
-    bd && bd.missingHeadings.length > 0
-      ? `<details style="display:inline"><summary style="cursor:pointer;color:#ef4444;font-size:0.75rem">${bd.missingHeadings.length} missing</summary><div style="font-size:0.7rem;color:#9ca3af;max-width:300px;white-space:normal">${bd.missingHeadings.slice(0, 10).map(escapeHtml).join("<br>")}</div></details>`
-      : bd
-        ? `<span style="color:#22c55e">None</span>`
-        : undefined;
-
-  const domDiffPanel = `
-  <div style="background:#1f2937;border-radius:8px;padding:1.25rem">
-    <div style="font-size:0.875rem;font-weight:600;color:#d1d5db;margin-bottom:1rem">DOM Fidelity</div>
-    <table style="width:100%;border-collapse:collapse">
-      <thead>
-        <tr>
-          <th style="${thStyle}">Metric</th>
-          ${colHeader}
-        </tr>
-      </thead>
-      <tbody>
-        ${row("DOM score", `<span style="color:${scoreColor(md.score)};font-weight:700">${md.score.toFixed(3)}</span>`, bd ? `<span style="color:${scoreColor(bd.score)};font-weight:700">${bd.score.toFixed(3)}</span>` : undefined)}
-        ${row("Text coverage", pct(md.textCoverageRatio), bd ? pct(bd.textCoverageRatio) : undefined)}
-        ${row("Missing headings", missingHeadingsMain, missingHeadingsBase)}
-        ${row("Image delta", deltaLabel(md.imageDelta), bd ? deltaLabel(bd.imageDelta) : undefined)}
-        ${row("Button delta", deltaLabel(md.buttonDelta), bd ? deltaLabel(bd.buttonDelta) : undefined)}
-        ${row("Section delta", deltaLabel(md.sectionDelta), bd ? deltaLabel(bd.sectionDelta) : undefined)}
-      </tbody>
-    </table>
-  </div>`;
-
   return `
   <section style="margin-bottom:2rem">
     <h2 style="font-size:1rem;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:1rem">Fidelity</h2>
     ${vlmPanel}
-    ${domDiffPanel}
   </section>`;
 }
 
@@ -465,10 +396,10 @@ export function generateReport(
           <thead>
             <tr>
               <th style="width:3rem">#</th>
-              <th style="width:7rem">Level</th>
+              <th style="width:5rem">Matched</th>
+              <th style="width:5rem">Unmatched</th>
               <th>Score</th>
               <th>Severity</th>
-              <th>Diff Pixels</th>
               <th style="width:7rem">Discrepancies</th>
             </tr>
           </thead>
