@@ -6,6 +6,7 @@ import type {
   VlmFidelityScore,
   DomDiffResult,
   FidelityMetrics,
+  FidelityLevel,
 } from "./types";
 
 // ─── Viewport ─────────────────────────────────────────────────────────────────
@@ -16,6 +17,8 @@ const VIEWPORT = { width: 1280, height: 900 };
 
 interface ScreenshotResult {
   screenshot: Buffer;
+  screenshotFold: Buffer;
+  screenshotWide: Buffer;
   domInfo: DomInfo;
 }
 
@@ -39,10 +42,33 @@ export async function screenshotAndExtract(
       timeout: 30_000,
     });
 
+    // Anthropic image API limit: 8000px per dimension. Cap height to stay safe.
+    const MAX_SCREENSHOT_HEIGHT = 7800;
+
+    // First-fold clip — used for VLM scoring only. Stable 1280×900 reference
+    // keeps convergence comparable across pages of any length.
+    const screenshotFold = await page.screenshot({
+      type: "png",
+      clip: { x: 0, y: 0, width: VIEWPORT.width, height: VIEWPORT.height },
+    });
+
+    const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+    const captureHeight = Math.min(scrollHeight, MAX_SCREENSHOT_HEIGHT);
     const screenshot = await page.screenshot({
       type: "png",
-      clip: { x: 0, y: 0, ...VIEWPORT },
+      clip: { x: 0, y: 0, width: VIEWPORT.width, height: captureHeight },
     });
+
+    // Second pass at 1920px to capture wide-viewport layout breakage
+    await page.setViewport({ width: 1920, height: 1080 });
+    const wideScrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+    const wideCaptureHeight = Math.min(wideScrollHeight, MAX_SCREENSHOT_HEIGHT);
+    const screenshotWide = await page.screenshot({
+      type: "png",
+      clip: { x: 0, y: 0, width: 1920, height: wideCaptureHeight },
+    });
+    // Restore original viewport
+    await page.setViewport(VIEWPORT);
 
     const domInfo = await page.evaluate((): DomInfo => {
       const headingEls = Array.from(
@@ -75,7 +101,7 @@ export async function screenshotAndExtract(
       };
     });
 
-    return { screenshot: Buffer.from(screenshot), domInfo };
+    return { screenshot: Buffer.from(screenshot), screenshotFold: Buffer.from(screenshotFold), screenshotWide: Buffer.from(screenshotWide), domInfo };
   } finally {
     await browser.close();
   }
@@ -179,6 +205,27 @@ export function scoreSeverity(score: number): "high" | "medium" | "low" {
   return "high";
 }
 
+// ─── Level classifier ────────────────────────────────────────────────────────
+
+// Tunable thresholds: advance to the next level only once the current one is met.
+const STRUCTURE_HEADING_THRESHOLD = 0.8; // headingRetentionRatio must reach this
+const CONTENT_TEXT_THRESHOLD = 0.7; // textCoverageRatio must reach this
+
+export function classifyLevel(domDiff: DomDiffResult): FidelityLevel {
+  if (domDiff.headingRetentionRatio < STRUCTURE_HEADING_THRESHOLD) return "structure";
+  if (domDiff.textCoverageRatio < CONTENT_TEXT_THRESHOLD) return "content";
+  return "visual";
+}
+
+// ─── Composite score ──────────────────────────────────────────────────────────
+
+const VLM_WEIGHT = 0.7;
+const DOM_WEIGHT = 0.3;
+
+export function computeCompositeScore(vlmScore: number, domScore: number): number {
+  return VLM_WEIGHT * vlmScore + DOM_WEIGHT * domScore;
+}
+
 // ─── Discrepancy captioner ─────────────────────────────────────────────────────
 
 const CAPTION_SYSTEM = `You are a visual discrepancy analyst. You will be shown two screenshots: SOURCE (original) and RECONSTRUCTION (generated). Identify specific visual issues in the reconstruction.
@@ -199,32 +246,50 @@ export interface Discrepancy {
 export async function captionDiscrepancies(
   sourceBase64: string,
   generatedBase64: string,
+  opts?: { sourceWideBase64?: string; generatedWideBase64?: string },
 ): Promise<Discrepancy[]> {
   try {
+    const userContent: Anthropic.MessageParam["content"] = [
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: sourceBase64 },
+      },
+      { type: "text", text: "SOURCE at 1280px above." },
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: generatedBase64 },
+      },
+      { type: "text", text: "RECONSTRUCTION at 1280px above." },
+    ];
+
+    if (opts?.sourceWideBase64 && opts?.generatedWideBase64) {
+      userContent.push(
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: opts.sourceWideBase64 },
+        },
+        { type: "text", text: "SOURCE at 1920px above." },
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: opts.generatedWideBase64 },
+        },
+        {
+          type: "text",
+          text: "RECONSTRUCTION at 1920px above. Include any wide-viewport layout breakage. List all high and medium severity discrepancies as a JSON array.",
+        },
+      );
+    } else {
+      userContent.push({
+        type: "text",
+        text: "RECONSTRUCTION above. List all high and medium severity discrepancies as a JSON array.",
+      });
+    }
+
     const response = await client.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 1024,
       system: CAPTION_SYSTEM,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image",
-              source: { type: "base64", media_type: "image/png", data: sourceBase64 },
-            },
-            { type: "text", text: "SOURCE screenshot above." },
-            {
-              type: "image",
-              source: { type: "base64", media_type: "image/png", data: generatedBase64 },
-            },
-            {
-              type: "text",
-              text: "RECONSTRUCTION screenshot above. List all high and medium severity discrepancies as a JSON array.",
-            },
-          ],
-        },
-      ],
+      messages: [{ role: "user", content: userContent }],
     });
 
     const text = response.content.find((b) => b.type === "text")?.text ?? "";
@@ -285,6 +350,7 @@ export function computeDomDiff(
     buttonDelta,
     sectionDelta,
     textCoverageRatio,
+    headingRetentionRatio,
     score,
   };
 }

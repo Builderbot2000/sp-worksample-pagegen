@@ -45,21 +45,26 @@ function scoreColor(score: number): string {
 
 function buildIterationRows(record: RunRecord): string {
   if (record.iterations.length === 0) {
-    return `<tr><td colspan="5" style="text-align:center;color:#6b7280;padding:1.5rem 0">No iterations recorded</td></tr>`;
+    return `<tr><td colspan="6" style="text-align:center;color:#6b7280;padding:1.5rem 0">No iterations recorded</td></tr>`;
   }
   return record.iterations
     .map((iter: IterationRecord) => {
       const color = severityColor(iter.severity);
       const barWidth = scoreBarWidth(iter.vlmScore);
+      const levelColor =
+        iter.level === "structure" ? "#3b82f6" : iter.level === "content" ? "#f59e0b" : "#22c55e";
       return `
       <tr>
         <td style="padding:0.6rem 1rem;text-align:center;font-variant-numeric:tabular-nums">${iter.iteration}</td>
+        <td style="padding:0.6rem 1rem;text-align:center">
+          <span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:4px;background:${levelColor}22;color:${levelColor};font-size:0.75rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">${iter.level}</span>
+        </td>
         <td style="padding:0.6rem 1rem">
           <div style="display:flex;align-items:center;gap:0.5rem">
-            <div style="flex:1;background:#1f2937;border-radius:3px;height:8px;overflow:hidden">
+            <div style="flex:1;background:#111827;border-radius:3px;height:8px;overflow:hidden">
               <div style="width:${barWidth}%;height:100%;background:${color};border-radius:3px"></div>
             </div>
-            <span style="font-variant-numeric:tabular-nums;font-size:0.875rem;color:${color}">${iter.vlmScore.toFixed(3)}</span>
+            <span style="font-variant-numeric:tabular-nums;font-size:0.875rem;color:${color}">${iter.compositeScore.toFixed(3)}</span>
           </div>
         </td>
         <td style="padding:0.6rem 1rem;color:${color};font-weight:600;font-size:0.875rem">${iter.severity}</td>
@@ -518,6 +523,7 @@ export function generateReport(
           <thead>
             <tr>
               <th style="width:3rem">#</th>
+              <th style="width:7rem">Level</th>
               <th>Score</th>
               <th>Severity</th>
               <th>Diff Pixels</th>

@@ -1,4 +1,5 @@
 import puppeteer from "puppeteer";
+import type { DomInfo } from "./observability/types";
 
 const VIEWPORT = { width: 1280, height: 900 };
 const MAX_HTML_CHARS = 80_000;
@@ -15,6 +16,9 @@ export interface EnrichedContext {
   html: string;
   truncated: boolean;
   screenshotBase64: string;
+  screenshotFoldBase64: string;
+  screenshotWideBase64: string;
+  domInfo: DomInfo;
   computedStyles: ComputedStyleEntry[];
   imageUrls: string[];
   fontFamilies: string[];
@@ -36,12 +40,36 @@ export async function enrichContext(url: string): Promise<EnrichedContext> {
       timeout: 30_000,
     });
 
-    // Screenshot
+    // Anthropic image API limit: 8000px per dimension. Cap height to stay safe.
+    const MAX_SCREENSHOT_HEIGHT = 7800;
+
+    // First-fold clip (1280×900) — used as VLM scoring reference in the fidelity
+    // loop so convergence is stable and comparable across pages of any length.
+    const screenshotFoldBuffer = await page.screenshot({
+      type: "png",
+      clip: { x: 0, y: 0, width: VIEWPORT.width, height: VIEWPORT.height },
+    });
+    const screenshotFoldBase64 = Buffer.from(screenshotFoldBuffer).toString("base64");
+
+    // Full-page screenshot (capped) — passed to the model so it sees all sections.
+    const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+    const captureHeight = Math.min(scrollHeight, MAX_SCREENSHOT_HEIGHT);
     const screenshotBuffer = await page.screenshot({
       type: "png",
-      clip: { x: 0, y: 0, ...VIEWPORT },
+      clip: { x: 0, y: 0, width: VIEWPORT.width, height: captureHeight },
     });
     const screenshotBase64 = Buffer.from(screenshotBuffer).toString("base64");
+
+    // Wide-viewport screenshot at 1920px for responsive fidelity checks
+    await page.setViewport({ width: 1920, height: 1080 });
+    const wideScrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+    const wideCaptureHeight = Math.min(wideScrollHeight, MAX_SCREENSHOT_HEIGHT);
+    const screenshotWideBuffer = await page.screenshot({
+      type: "png",
+      clip: { x: 0, y: 0, width: 1920, height: wideCaptureHeight },
+    });
+    const screenshotWideBase64 = Buffer.from(screenshotWideBuffer).toString("base64");
+    await page.setViewport(VIEWPORT);
 
     // HTML
     const rawHtml = await page.content();
@@ -120,13 +148,36 @@ export async function enrichContext(url: string): Promise<EnrichedContext> {
         .slice(0, 5)
         .map((s) => s.outerHTML);
 
-      return { uniqueImageUrls, uniqueFontFamilies, computedStyles, svgs };
+      // ── DOM info (mirrors screenshotAndExtract for composite scoring) ──────
+      const headingEls = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6"));
+      const headings = headingEls.map((el) => ({
+        tag: el.tagName.toLowerCase(),
+        text: (el.textContent ?? "").trim().slice(0, 200),
+      }));
+      const domInfo = {
+        headings,
+        paragraphs: document.querySelectorAll("p").length,
+        images: document.querySelectorAll("img,svg,picture").length,
+        buttons: document.querySelectorAll(
+          'button,a[role="button"],[type="button"],[type="submit"]',
+        ).length,
+        sections: document.querySelectorAll(
+          "section,article,main,aside,nav,header,footer",
+        ).length,
+        links: document.querySelectorAll("a[href]").length,
+        totalTextLength: (document.body.innerText ?? "").length,
+      };
+
+      return { uniqueImageUrls, uniqueFontFamilies, computedStyles, svgs, domInfo };
     });
 
     return {
       html,
       truncated,
       screenshotBase64,
+      screenshotFoldBase64,
+      screenshotWideBase64,
+      domInfo: extracted.domInfo,
       computedStyles: extracted.computedStyles,
       imageUrls: extracted.uniqueImageUrls,
       fontFamilies: extracted.uniqueFontFamilies,

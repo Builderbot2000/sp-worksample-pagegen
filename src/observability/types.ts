@@ -2,6 +2,10 @@
 
 export type Severity = "high" | "medium" | "low";
 
+// ─── Fidelity level ───────────────────────────────────────────────────────────
+
+export type FidelityLevel = "structure" | "content" | "visual";
+
 // ─── Phase data interfaces ────────────────────────────────────────────────────
 
 export interface FetchData {
@@ -31,6 +35,9 @@ export interface DiffData {
   iteration: number;
   vlmScore: number;
   vlmVerdict: VlmVerdict;
+  level?: FidelityLevel;
+  domScore?: number;
+  compositeScore?: number;
 }
 
 export interface CaptionData {
@@ -63,8 +70,11 @@ export type LogLine =
 
 export interface IterationRecord {
   iteration: number;
+  level: FidelityLevel;
   vlmScore: number;
   vlmVerdict: VlmVerdict;
+  domScore: number;
+  compositeScore: number;
   severity: Severity;
   discrepancyCount: number;
 }
@@ -108,6 +118,7 @@ export interface DomDiffResult {
   buttonDelta: number;
   sectionDelta: number;
   textCoverageRatio: number;
+  headingRetentionRatio: number;
   score: number;
 }
 

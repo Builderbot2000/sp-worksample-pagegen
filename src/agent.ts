@@ -7,16 +7,19 @@ import { renderStream } from "./render";
 import { enrichContext } from "./context";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
-import { estimateCost } from "./observability/metrics";
+import { estimateCost, estimateMaxTokens } from "./observability/metrics";
 import {
   collectFidelityMetrics,
   screenshotAndExtract,
   computeVlmFidelityScore,
   scoreSeverity,
   captionDiscrepancies,
+  classifyLevel,
+  computeCompositeScore,
+  computeDomDiff,
 } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
-import type { RunRecord } from "./observability/types";
+import type { RunRecord, FidelityLevel } from "./observability/types";
 
 const BASELINE_MODEL = "claude-haiku-4-5";
 
@@ -90,7 +93,7 @@ async function runBaseline(
   const start = Date.now();
   const runner = client.beta.messages.toolRunner({
     model: BASELINE_MODEL,
-    max_tokens: 16000,
+    max_tokens: estimateMaxTokens(truncatedHtml.length, BASELINE_MODEL),
     tools: [saveFile],
     tool_choice: { type: "tool", name: "save_file" },
     stream: true,
@@ -179,7 +182,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
 
   const runner = client.beta.messages.toolRunner({
     model: "claude-haiku-4-5",
-    max_tokens: 16000,
+    max_tokens: estimateMaxTokens(context.html.length, "claude-haiku-4-5"),
     tools: [saveFile],
     tool_choice: { type: "tool", name: "save_file" },
     stream: true,
@@ -208,7 +211,10 @@ The page MUST:
 - Use the Tailwind CSS CDN (<script src="https://cdn.tailwindcss.com"></script>)
 - Faithfully reproduce the layout, content, colours, typography, and visual style visible in the screenshot
 - Use the absolute image URLs provided below so assets resolve correctly
-- Be responsive and well-structured
+- Be responsive across all viewport widths from 375px (mobile) through 2560px+ (large desktop):
+  - Use Tailwind's max-w-* and mx-auto for all layout containers — never use fixed pixel widths
+  - Use xl: and 2xl: breakpoint variants to keep proportions correct at wide viewports
+  - The reference screenshot is captured at 1280px; ensure nothing is broken or unnaturally stretched beyond that
 - Use descriptive kebab-case filename based on the source page's title or domain
 
 <computed_styles>
@@ -268,72 +274,84 @@ ${context.html}
   // ─── Iterative fidelity loop ────────────────────────────────────────────────
   const MAX_ITER = opts.iterations ?? 4;
   const CONV_THRESHOLD = opts.threshold ?? 0.02;
+  const sourceFoldBase64 = context.screenshotFoldBase64;
   const sourceBase64 = context.screenshotBase64;
-  let prevScore: number | null = null;
+  const sourceWideBase64 = context.screenshotWideBase64;
+  const sourceDomInfo = context.domInfo;
+  let prevCompositeScore: number | null = null;
 
   if (savedPath) {
     for (let i = 0; i < MAX_ITER; i++) {
       console.log(`\n[fidelity] Iteration ${i + 1}/${MAX_ITER} — scoring...`);
 
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      const { screenshot: genBuf } = await screenshotAndExtract({ file: savedPath! });
+      const { screenshot: genBuf, screenshotFold: genFoldBuf, screenshotWide: genWideBuf, domInfo: genDomInfo } =
+        await screenshotAndExtract({ file: savedPath! });
       const genBase64 = genBuf.toString("base64");
+      const genFoldBase64 = genFoldBuf.toString("base64");
+      const genWideBase64 = genWideBuf.toString("base64");
 
-      const vlmScore = await computeVlmFidelityScore(sourceBase64, genBase64);
-      const severity = scoreSeverity(vlmScore.score);
+      // ── Level classification via DOM diff (no VLM cost) ──────────────────
+      const domDiff = computeDomDiff(sourceDomInfo, genDomInfo);
+      const level: FidelityLevel = classifyLevel(domDiff);
+
+      // ── VLM scoring only at visual level (fold screenshots for stability) ─
+      let vlmScore: Awaited<ReturnType<typeof computeVlmFidelityScore>> | null = null;
+      let severity: "high" | "medium" | "low" = "high";
+      if (level === "visual") {
+        vlmScore = await computeVlmFidelityScore(sourceFoldBase64, genFoldBase64);
+        severity = scoreSeverity(vlmScore.score);
+      }
+
+      const compositeScore =
+        level === "visual" && vlmScore !== null
+          ? computeCompositeScore(vlmScore.score, domDiff.score)
+          : domDiff.score;
 
       logger.log({
         phase: "diff",
         timestamp: Date.now(),
-        data: { iteration: i + 1, vlmScore: vlmScore.score, vlmVerdict: vlmScore.verdict },
+        data: {
+          iteration: i + 1,
+          vlmScore: vlmScore?.score ?? 0,
+          vlmVerdict: vlmScore?.verdict ?? "distant",
+          level,
+          domScore: domDiff.score,
+          compositeScore,
+        },
       });
 
       const iterRecord = {
         iteration: i + 1,
-        vlmScore: vlmScore.score,
-        vlmVerdict: vlmScore.verdict,
+        level,
+        vlmScore: vlmScore?.score ?? 0,
+        vlmVerdict: vlmScore?.verdict ?? "distant",
+        domScore: domDiff.score,
+        compositeScore,
         severity,
         discrepancyCount: 0,
       };
 
-      console.log(`[fidelity] Score: ${vlmScore.score.toFixed(3)} (${severity})`);
+      console.log(
+        `[fidelity] Level: ${level} | DOM: ${domDiff.score.toFixed(3)} (hr=${domDiff.headingRetentionRatio.toFixed(2)} tc=${domDiff.textCoverageRatio.toFixed(2)})` +
+          (level === "visual" && vlmScore ? ` | VLM: ${vlmScore.score.toFixed(3)} (${severity})` : "") +
+          ` | Composite: ${compositeScore.toFixed(3)}`,
+      );
 
-      if (severity === "low") {
+      // ── Convergence checks ────────────────────────────────────────────────
+      if (level === "visual" && severity === "low") {
         console.log("[fidelity] Severity low — converged, stopping loop.");
         record.iterations.push(iterRecord);
         break;
       }
 
-      if (prevScore !== null && Math.abs(vlmScore.score - prevScore) < CONV_THRESHOLD) {
-        console.log("[fidelity] Score delta below threshold — converged, stopping loop.");
+      if (prevCompositeScore !== null && Math.abs(compositeScore - prevCompositeScore) < CONV_THRESHOLD) {
+        console.log("[fidelity] Composite score delta below threshold — converged, stopping loop.");
         record.iterations.push(iterRecord);
         break;
       }
 
-      console.log(`[fidelity] Captioning discrepancies...`);
-      const discrepancies = await captionDiscrepancies(sourceBase64, genBase64);
-
-      iterRecord.discrepancyCount = discrepancies.length;
-      record.iterations.push(iterRecord);
-
-      logger.log({
-        phase: "caption",
-        timestamp: Date.now(),
-        data: {
-          iteration: i + 1,
-          tokensIn: 0,
-          tokensOut: 0,
-          discrepancies,
-        },
-      });
-
-      if (discrepancies.length === 0) {
-        console.log("[fidelity] No actionable discrepancies — stopping loop.");
-        break;
-      }
-
-      console.log(`[fidelity] ${discrepancies.length} discrepancies — running fix pass...`);
-
+      // ── Fix pass ──────────────────────────────────────────────────────────
       const currentFilePath = savedPath!;
       const currentHtml = fs.readFileSync(currentFilePath, "utf-8");
       savedPath = null;
@@ -353,30 +371,71 @@ ${context.html}
         },
       });
 
-      const discrepancyList = discrepancies
-        .map((d) => `[${d.severity}] ${d.section}: ${d.issue}`)
-        .join("\n");
+      let fixSystem: string;
+      let fixUserText: string;
+      let fixImageBase64: string;
 
-      const fixStart = Date.now();
-      const fixRunner = client.beta.messages.toolRunner({
-        model: "claude-sonnet-4-6",
-        max_tokens: 32000,
-        tools: [fixSaveFile],
-        tool_choice: { type: "tool", name: "save_file" },
-        stream: true,
-        max_iterations: 1,
-        system: `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. You will be shown the source page screenshot and a list of specific discrepancies. Fix ONLY the listed issues — do not modify sections that are already correct.`,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "image",
-                source: { type: "base64", media_type: "image/png", data: sourceBase64 },
-              },
-              {
-                type: "text",
-                text: `The image above is the SOURCE page you must match. The HTML below is the current reconstruction. Fix ONLY the discrepancies listed — do not change anything else.
+      const STRUCTURE_BATCH = 15;
+      if (level === "structure") {
+        const batch = domDiff.missingHeadings.slice(0, STRUCTURE_BATCH);
+        const missingList = batch.join("\n");
+        const remaining = domDiff.missingHeadings.length - batch.length;
+        console.log(`[fidelity] Structure pass — adding ${batch.length} of ${domDiff.missingHeadings.length} missing headings (${remaining} remaining)`);
+        fixSystem = `You are an expert front-end developer completing a partially-generated HTML page. Your ONLY task is to add the missing sections listed below in the correct order. Do NOT change any section that already exists. Use responsive Tailwind classes (max-w-* mx-auto, xl:/2xl: variants).`;
+        fixImageBase64 = sourceFoldBase64;
+        fixUserText = `The image above is the SOURCE page first fold. The HTML below is missing these sections — add them in the order they appear on the source page:
+
+<missing_sections>
+${missingList}
+</missing_sections>
+
+<current_html>
+${currentHtml}
+</current_html>`;
+        iterRecord.discrepancyCount = domDiff.missingHeadings.length;
+      } else if (level === "content") {
+        // Level 2: fill copy and images into existing skeleton
+        console.log(
+          `[fidelity] Content pass — text coverage ${(domDiff.textCoverageRatio * 100).toFixed(0)}%, image delta ${domDiff.imageDelta}`,
+        );
+        fixSystem = `You are an expert front-end developer filling in missing content in a generated HTML page. Your ONLY task is to add missing copy and images. Do NOT change the layout, colours, or visual styling.`;
+        fixImageBase64 = sourceBase64;
+        fixUserText = `The image above is the full SOURCE page. The HTML below has the right structure but is missing content:
+- Text coverage: ${(domDiff.textCoverageRatio * 100).toFixed(0)}% of source (target ≥70%)
+- Image delta: ${domDiff.imageDelta} (negative = missing images)
+
+Add missing body copy and images to match the source. Do not touch layout or styling.
+
+<current_html>
+${currentHtml}
+</current_html>`;
+        iterRecord.discrepancyCount = Math.round((1 - domDiff.textCoverageRatio) * 10);
+      } else {
+        // Level 3: visual fix using VLM discrepancy list
+        console.log(`[fidelity] Captioning discrepancies...`);
+        const discrepancies = await captionDiscrepancies(sourceFoldBase64, genFoldBase64, {
+          sourceWideBase64,
+          generatedWideBase64: genWideBase64,
+        });
+        iterRecord.discrepancyCount = discrepancies.length;
+
+        logger.log({
+          phase: "caption",
+          timestamp: Date.now(),
+          data: { iteration: i + 1, tokensIn: 0, tokensOut: 0, discrepancies },
+        });
+
+        if (discrepancies.length === 0) {
+          console.log("[fidelity] No actionable discrepancies — stopping loop.");
+          record.iterations.push(iterRecord);
+          break;
+        }
+
+        console.log(`[fidelity] ${discrepancies.length} discrepancies — visual fix pass...`);
+        const discrepancyList = discrepancies.map((d) => `[${d.severity}] ${d.section}: ${d.issue}`).join("\n");
+        fixSystem = `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. You will be shown the source page screenshot and a list of specific discrepancies. Fix ONLY the listed issues — do not modify sections that are already correct. All fixes must use responsive Tailwind classes that render correctly from 1280px through 2560px+; never use fixed pixel widths on containers.`;
+        fixImageBase64 = sourceFoldBase64;
+        fixUserText = `The image above is the SOURCE page you must match. The HTML below is the current reconstruction. Fix ONLY the discrepancies listed — do not change anything else.
 
 <discrepancies>
 ${discrepancyList}
@@ -384,8 +443,31 @@ ${discrepancyList}
 
 <current_html>
 ${currentHtml}
-</current_html>`,
+</current_html>`;
+      }
+
+      record.iterations.push(iterRecord);
+
+      const fixStart = Date.now();
+      const fixRunner = client.beta.messages.toolRunner({
+        model: "claude-sonnet-4-6",
+        max_tokens: level === "structure"
+          ? 65536
+          : estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"),
+        tools: [fixSaveFile],
+        tool_choice: { type: "tool", name: "save_file" },
+        stream: true,
+        max_iterations: 1,
+        system: fixSystem,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: { type: "base64", media_type: "image/png", data: fixImageBase64 },
               },
+              { type: "text", text: fixUserText },
             ],
           },
         ],
@@ -411,7 +493,12 @@ ${currentHtml}
         },
       });
 
-      prevScore = vlmScore.score;
+      if (!savedPath) {
+        console.log("[fidelity] Fix pass did not save a file — stopping loop.");
+        break;
+      }
+
+      prevCompositeScore = compositeScore;
     }
   }
 
