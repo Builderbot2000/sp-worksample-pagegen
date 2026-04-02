@@ -11,7 +11,8 @@ import { estimateCost, estimateMaxTokens, computeIterBudget } from "./observabil
 import {
   collectFidelityMetrics,
   screenshotAndExtract,
-  computeVlmFidelityScore,
+  computeChunkedVlmScore,
+  CHUNK_HARD_CAP,
   scoreSeverity,
   captionDiscrepancies,
   classifyLevel,
@@ -19,7 +20,7 @@ import {
   computeDomDiff,
 } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
-import type { RunRecord, FidelityLevel, FidelityMode } from "./observability/types";
+import type { RunRecord, FidelityLevel, FidelityMode, ChunkedVlmScore } from "./observability/types";
 
 const BASELINE_MODEL = "claude-haiku-4-5";
 const GENERATE_MODEL = "claude-sonnet-4-6";
@@ -48,14 +49,19 @@ export interface FidelityBudget {
   visualFixMaxTokens: number | null;
   captionMaxTokens: number;
   useWideViewport: boolean;
+  /**
+   * Multiplier applied to (scrollHeight / viewportHeight) to determine how
+   * many heading-anchored VLM chunks to use. 0 = use fold only (1 chunk).
+   */
+  vlmChunkMultiplier: number;
 }
 
 const FIDELITY_BUDGETS: Record<FidelityMode, FidelityBudget> = {
-  minimal:  { minIterations: 0,  maxIterations: 0,  structureBatchSize: undefined, generateMaxTokens: 8_000,  structureFixFloor: undefined, contentFixMaxTokens: null,   visualFixMaxTokens: null,   captionMaxTokens: 1_024, useWideViewport: false },
-  fast:     { minIterations: 2,  maxIterations: 3,  structureBatchSize: 10,        generateMaxTokens: 12_000, structureFixFloor: 24_576,   contentFixMaxTokens: 32_768, visualFixMaxTokens: 24_576, captionMaxTokens: 512,   useWideViewport: false },
-  balanced: { minIterations: 3,  maxIterations: 6,  structureBatchSize: 15,        generateMaxTokens: null,   structureFixFloor: 40_960,   contentFixMaxTokens: null,   visualFixMaxTokens: null,   captionMaxTokens: 1_024, useWideViewport: true  },
-  high:     { minIterations: 4,  maxIterations: 8,  structureBatchSize: 20,        generateMaxTokens: null,   structureFixFloor: 49_152,   contentFixMaxTokens: 65_536, visualFixMaxTokens: 65_536, captionMaxTokens: 1_024, useWideViewport: true  },
-  maximal:  { minIterations: 6,  maxIterations: 12, structureBatchSize: 30,        generateMaxTokens: null,   structureFixFloor: 57_344,   contentFixMaxTokens: 65_536, visualFixMaxTokens: 65_536, captionMaxTokens: 2_048, useWideViewport: true  },
+  minimal:  { minIterations: 0,  maxIterations: 0,  structureBatchSize: undefined, generateMaxTokens: 8_000,  structureFixFloor: undefined, contentFixMaxTokens: null,   visualFixMaxTokens: null,   captionMaxTokens: 1_024, useWideViewport: false, vlmChunkMultiplier: 0   },
+  fast:     { minIterations: 2,  maxIterations: 3,  structureBatchSize: 10,        generateMaxTokens: 12_000, structureFixFloor: 24_576,   contentFixMaxTokens: 32_768, visualFixMaxTokens: 24_576, captionMaxTokens: 512,   useWideViewport: false, vlmChunkMultiplier: 0.4 },
+  balanced: { minIterations: 3,  maxIterations: 6,  structureBatchSize: 15,        generateMaxTokens: null,   structureFixFloor: 40_960,   contentFixMaxTokens: null,   visualFixMaxTokens: null,   captionMaxTokens: 1_024, useWideViewport: true,  vlmChunkMultiplier: 0.6 },
+  high:     { minIterations: 4,  maxIterations: 8,  structureBatchSize: 20,        generateMaxTokens: null,   structureFixFloor: 49_152,   contentFixMaxTokens: 65_536, visualFixMaxTokens: 65_536, captionMaxTokens: 1_024, useWideViewport: true,  vlmChunkMultiplier: 0.8 },
+  maximal:  { minIterations: 6,  maxIterations: 12, structureBatchSize: 30,        generateMaxTokens: null,   structureFixFloor: 57_344,   contentFixMaxTokens: 65_536, visualFixMaxTokens: 65_536, captionMaxTokens: 2_048, useWideViewport: true,  vlmChunkMultiplier: 1.0 },
 };
 
 const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
@@ -333,6 +339,8 @@ ${context.html}
   const sourceFoldBase64 = context.screenshotFoldBase64;
   const sourceBase64 = context.screenshotBase64;
   const sourceWideBase64 = context.screenshotWideBase64;
+  const sourceChunks = context.screenshotChunksBase64;
+  const sourceScrollHeight = context.scrollHeight;
   const sourceDomInfo = context.domInfo;
   let prevCompositeScore: number | null = null;
 
@@ -341,27 +349,47 @@ ${context.html}
       console.log(`\n[fidelity] Iteration ${i + 1}/${MAX_ITER} — scoring...`);
 
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      const { screenshot: genBuf, screenshotFold: genFoldBuf, screenshotWide: genWideBuf, domInfo: genDomInfo } =
-        await screenshotAndExtract({ file: savedPath! }, { useWideViewport: budget.useWideViewport });
+      const { screenshot: genBuf, screenshotFold: genFoldBuf, screenshotWide: genWideBuf, screenshotChunks: genChunksBuf, domInfo: genDomInfo } =
+        await screenshotAndExtract(
+          { file: savedPath! },
+          {
+            useWideViewport: budget.useWideViewport,
+            // Drive gen chunk capture from source heading texts so chunk labels
+            // are identical on both sides and fuzzy-match failures can't cause
+            // present sections to be scored as absent.
+            targetHeadings: sourceChunks
+              .map((c) => c.heading)
+              .filter((h) => h !== "FOLD"),
+          },
+        );
       const genBase64 = genBuf.toString("base64");
       const genFoldBase64 = genFoldBuf.toString("base64");
       const genWideBase64 = genWideBuf.toString("base64");
+      const genChunks = genChunksBuf.map((c) => ({ heading: c.heading, screenshot: c.screenshot.toString("base64") }));
+
+      // ── How many chunks to score this iteration ───────────────────────────
+      // Dynamic: scale by (scrollHeight / viewportHeight) * mode multiplier,
+      // clamped to [1, CHUNK_HARD_CAP]. 0 multiplier (minimal mode) → 1 chunk.
+      const VIEWPORT_H = 900;
+      const maxChunks = budget.vlmChunkMultiplier === 0
+        ? 1
+        : Math.max(1, Math.min(CHUNK_HARD_CAP, Math.ceil((sourceScrollHeight / VIEWPORT_H) * budget.vlmChunkMultiplier)));
 
       // ── Level classification via DOM diff (no VLM cost) ──────────────────
       const domDiff = computeDomDiff(sourceDomInfo, genDomInfo);
       const level: FidelityLevel = classifyLevel(domDiff);
 
-      // ── VLM scoring only at visual level (fold screenshots for stability) ─
-      let vlmScore: Awaited<ReturnType<typeof computeVlmFidelityScore>> | null = null;
+      // ── VLM scoring only at visual level (chunk-based for coverage) ──────
+      let chunkedVlm: ChunkedVlmScore | null = null;
       let severity: "high" | "medium" | "low" = "high";
       if (level === "visual") {
-        vlmScore = await computeVlmFidelityScore(sourceFoldBase64, genFoldBase64);
-        severity = scoreSeverity(vlmScore.score);
+        chunkedVlm = await computeChunkedVlmScore(sourceChunks, genChunks, maxChunks);
+        severity = scoreSeverity(chunkedVlm.aggregateScore);
       }
 
       const compositeScore =
-        level === "visual" && vlmScore !== null
-          ? computeCompositeScore(vlmScore.score, domDiff.score)
+        level === "visual" && chunkedVlm !== null
+          ? computeCompositeScore(chunkedVlm.aggregateScore, domDiff.score)
           : domDiff.score;
 
       logger.log({
@@ -369,8 +397,8 @@ ${context.html}
         timestamp: Date.now(),
         data: {
           iteration: i + 1,
-          vlmScore: vlmScore?.score ?? 0,
-          vlmVerdict: vlmScore?.verdict ?? "distant",
+          vlmScore: chunkedVlm?.aggregateScore ?? 0,
+          vlmVerdict: chunkedVlm?.aggregateVerdict ?? "distant",
           level,
           domScore: domDiff.score,
           compositeScore,
@@ -380,17 +408,20 @@ ${context.html}
       const iterRecord = {
         iteration: i + 1,
         level,
-        vlmScore: vlmScore?.score ?? 0,
-        vlmVerdict: vlmScore?.verdict ?? "distant",
+        vlmScore: chunkedVlm?.aggregateScore ?? 0,
+        vlmVerdict: chunkedVlm?.aggregateVerdict ?? "distant",
         domScore: domDiff.score,
         compositeScore,
         severity,
         discrepancyCount: 0,
+        ...(chunkedVlm ? { vlmChunks: chunkedVlm.chunks } : {}),
       };
 
       console.log(
         `[fidelity] Level: ${level} | DOM: ${domDiff.score.toFixed(3)} (hr=${domDiff.headingRetentionRatio.toFixed(2)} tc=${domDiff.textCoverageRatio.toFixed(2)})` +
-          (level === "visual" && vlmScore ? ` | VLM: ${vlmScore.score.toFixed(3)} (${severity})` : "") +
+          (level === "visual" && chunkedVlm
+            ? ` | VLM: ${chunkedVlm.aggregateScore.toFixed(3)} (${severity}) [${chunkedVlm.chunks.length} chunks]`
+            : "") +
           ` | Composite: ${compositeScore.toFixed(3)}`,
       );
 

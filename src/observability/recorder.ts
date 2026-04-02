@@ -25,7 +25,7 @@ export class Recorder {
     const stripImages = (r: RunRecord): RunRecord => {
       const { fidelityMetrics, baseline, ...rest } = r;
       const strippedFidelity = fidelityMetrics
-        ? (({ sourceScreenshotBase64, mainScreenshotBase64, baselineScreenshotBase64, ...metrics }) => metrics)(fidelityMetrics)
+        ? (({ sourceScreenshotBase64, mainScreenshotBase64, baselineScreenshotBase64, ...metrics }) => metrics)(fidelityMetrics) as unknown as RunRecord["fidelityMetrics"]
         : undefined;
       const strippedBaseline = baseline
         ? { ...baseline, mainThumbnail: "", baselineThumbnail: "" }

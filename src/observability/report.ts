@@ -170,7 +170,7 @@ function buildComparisonSection(
       <div style="font-size:1.5rem;font-weight:700;color:${scoreColor(b.mainScore)};margin-bottom:0.25rem">${b.mainScore.toFixed(3)}</div>
       <div style="font-size:0.8rem;color:#6b7280;margin-bottom:0.1rem">$${b.mainCostUsd.toFixed(3)}</div>
       <div style="font-size:0.8rem;color:#6b7280;margin-bottom:0.75rem">${formatDuration(durationMs)}</div>
-      ${b.mainThumbnail ? `<div style="overflow:auto;max-height:400px"><img src="data:image/png;base64,${b.mainThumbnail}" style="width:100%;border-radius:4px" /></div>` : ""}
+      ${b.mainThumbnail ? `<div style="overflow:hidden;height:320px;border-radius:4px"><img src="data:image/png;base64,${b.mainThumbnail}" style="width:100%;display:block" /></div>` : ""}
     </div>`;
 
   const baselineCard = `
@@ -179,7 +179,7 @@ function buildComparisonSection(
       <div style="font-size:1.5rem;font-weight:700;color:${scoreColor(b.baselineScore)};margin-bottom:0.25rem">${b.baselineScore.toFixed(3)}</div>
       <div style="font-size:0.8rem;color:#6b7280;margin-bottom:0.1rem">$${b.baselineCostUsd.toFixed(3)}</div>
       <div style="font-size:0.8rem;color:#6b7280;margin-bottom:0.75rem">${formatDuration(b.baselineDurationMs)}</div>
-      ${b.baselineThumbnail ? `<div style="overflow:auto;max-height:400px"><img src="data:image/png;base64,${b.baselineThumbnail}" style="width:100%;border-radius:4px" /></div>` : ""}
+      ${b.baselineThumbnail ? `<div style="overflow:hidden;height:320px;border-radius:4px"><img src="data:image/png;base64,${b.baselineThumbnail}" style="width:100%;display:block" /></div>` : ""}
     </div>`;
 
   const scoreDelta = b.mainScore - b.baselineScore;
@@ -208,65 +208,7 @@ function buildComparisonSection(
   </section>`;
 }
 
-// ─── Page viewer section ──────────────────────────────────────────────────────
 
-function buildPageViewerSection(url: string, runDir: string, sourceScreenshotBase64?: string): string {
-  function firstHtmlIn(dir: string): string | null {
-    try {
-      const files = fs.readdirSync(dir).filter((f) => f.endsWith(".html"));
-      return files.length > 0 ? path.join(dir, files[0]) : null;
-    } catch {
-      return null;
-    }
-  }
-
-  const mainFile = firstHtmlIn(path.join(runDir, "main"));
-  const baselineFile = firstHtmlIn(path.join(runDir, "baseline"));
-
-  const iframeStyle =
-    "width:100%;height:600px;border:none;border-radius:6px;background:#fff";
-  const labelStyle =
-    "font-size:0.75rem;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.5rem";
-  const cardStyle =
-    "flex:1;min-width:0;background:#1f2937;border-radius:8px;padding:1rem;overflow:hidden";
-
-  const sourceContent = sourceScreenshotBase64
-    ? `<img src="data:image/png;base64,${sourceScreenshotBase64}" style="width:100%;border-radius:6px;display:block" />`
-    : `<iframe src="${escapeHtml(url)}" style="${iframeStyle}" loading="lazy" sandbox="allow-scripts allow-same-origin"></iframe>`;
-
-  const sourcePane = `
-    <div style="${cardStyle}">
-      <div style="${labelStyle}">Source</div>
-      <div style="font-size:0.7rem;color:#4b5563;margin-bottom:0.5rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(url)}">${escapeHtml(url)}</div>
-      ${sourceContent}
-    </div>`;
-
-  const mainPane = mainFile
-    ? `<div style="${cardStyle}">
-      <div style="${labelStyle}">Experimental</div>
-      <div style="font-size:0.7rem;color:#4b5563;margin-bottom:0.5rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(path.relative(runDir, mainFile))}</div>
-      <iframe src="${escapeHtml(path.relative(runDir, mainFile))}" style="${iframeStyle}"></iframe>
-    </div>`
-    : "";
-
-  const baselinePane = baselineFile
-    ? `<div style="${cardStyle}">
-      <div style="${labelStyle}">Baseline</div>
-      <div style="font-size:0.7rem;color:#4b5563;margin-bottom:0.5rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(path.relative(runDir, baselineFile))}</div>
-      <iframe src="${escapeHtml(path.relative(runDir, baselineFile))}" style="${iframeStyle}"></iframe>
-    </div>`
-    : "";
-
-  return `
-  <section style="margin-bottom:2rem">
-    <h2 style="font-size:1rem;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:1rem">Page Viewer</h2>
-    <div style="display:flex;gap:1rem;align-items:flex-start">
-      ${sourcePane}
-      ${mainPane}
-      ${baselinePane}
-    </div>
-  </section>`;
-}
 
 // ─── Fidelity section ─────────────────────────────────────────────────────────
 
@@ -461,7 +403,7 @@ export function generateReport(
   </style>
 </head>
 <body>
-  <div style="max-width:900px;margin:0 auto">
+  <div style="max-width:1600px;margin:0 auto">
 
     <header style="margin-bottom:2rem">
       <h1 style="font-size:1.5rem;font-weight:700;color:#f9fafb;margin-bottom:0.25rem">${displayName}</h1>
@@ -539,7 +481,6 @@ export function generateReport(
 
     ${buildMetricsComparison(record)}
     ${buildComparisonSection(record, sourceThumbnail)}
-    ${buildPageViewerSection(record.url, runDir, record.fidelityMetrics?.sourceScreenshotBase64)}
     ${record.fidelityMetrics ? buildFidelitySection(record.fidelityMetrics) : ""}
 
   </div>

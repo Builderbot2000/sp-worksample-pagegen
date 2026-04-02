@@ -84,6 +84,7 @@ export interface IterationRecord {
   compositeScore: number;
   severity: Severity;
   discrepancyCount: number;
+  vlmChunks?: VlmChunkScore[];
 }
 
 export interface BaselineComparison {
@@ -100,7 +101,7 @@ export interface BaselineComparison {
 // ─── Fidelity metrics ────────────────────────────────────────────────────────
 
 export interface DomInfo {
-  headings: Array<{ tag: string; text: string }>;
+  headings: Array<{ tag: string; text: string; y: number }>;
   paragraphs: number;
   images: number;
   buttons: number;
@@ -110,6 +111,21 @@ export interface DomInfo {
 }
 
 export type VlmVerdict = "close" | "partial" | "distant";
+
+// ─── Chunked VLM scoring ─────────────────────────────────────────────────────
+
+export interface VlmChunkScore {
+  heading: string;
+  score: number;
+  verdict: VlmVerdict;
+  issues: string[];
+}
+
+export interface ChunkedVlmScore {
+  chunks: VlmChunkScore[];
+  aggregateScore: number;
+  aggregateVerdict: VlmVerdict;
+}
 
 export interface VlmFidelityScore {
   verdict: VlmVerdict;

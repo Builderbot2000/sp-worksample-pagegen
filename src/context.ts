@@ -1,5 +1,6 @@
 import puppeteer from "puppeteer";
 import type { DomInfo } from "./observability/types";
+import { CHUNK_HARD_CAP } from "./observability/fidelity";
 
 const VIEWPORT = { width: 1280, height: 900 };
 const MAX_HTML_CHARS = 80_000;
@@ -18,6 +19,8 @@ export interface EnrichedContext {
   screenshotBase64: string;
   screenshotFoldBase64: string;
   screenshotWideBase64: string;
+  scrollHeight: number;
+  screenshotChunksBase64: Array<{ heading: string; screenshot: string }>;
   domInfo: DomInfo;
   computedStyles: ComputedStyleEntry[];
   imageUrls: string[];
@@ -153,6 +156,7 @@ export async function enrichContext(url: string): Promise<EnrichedContext> {
       const headings = headingEls.map((el) => ({
         tag: el.tagName.toLowerCase(),
         text: (el.textContent ?? "").trim().slice(0, 200),
+        y: el.getBoundingClientRect().top + window.scrollY,
       }));
       const domInfo = {
         headings,
@@ -171,12 +175,49 @@ export async function enrichContext(url: string): Promise<EnrichedContext> {
       return { uniqueImageUrls, uniqueFontFamilies, computedStyles, svgs, domInfo };
     });
 
+    // ── Heading-anchored chunk screenshots ────────────────────────────────────
+    // Always fold (y=0) plus one chunk per h1/h2 heading, de-duped +
+    // capped at CHUNK_HARD_CAP. Source chunks are taken once and reused
+    // across all scoring iterations.
+    const screenshotChunksBase64: Array<{ heading: string; screenshot: string }> = [];
+
+    screenshotChunksBase64.push({
+      heading: "FOLD",
+      screenshot: screenshotFoldBase64,
+    });
+
+    const h1h2 = extracted.domInfo.headings
+      .filter((h) => h.tag === "h1" || h.tag === "h2")
+      .sort((a, b) => a.y - b.y);
+
+    const maxHeadingChunks = CHUNK_HARD_CAP - 1;
+    const step = h1h2.length > maxHeadingChunks ? h1h2.length / maxHeadingChunks : 1;
+    let lastY = -Infinity;
+    let idx = 0;
+    while (screenshotChunksBase64.length < CHUNK_HARD_CAP && idx < h1h2.length) {
+      const heading = h1h2[Math.min(Math.floor(idx * step), h1h2.length - 1)];
+      idx++;
+      if (heading.y - lastY < 100) continue;
+      const clipY = Math.min(heading.y, scrollHeight - VIEWPORT.height);
+      const chunkBuf = await page.screenshot({
+        type: "png",
+        clip: { x: 0, y: Math.max(0, clipY), width: VIEWPORT.width, height: VIEWPORT.height },
+      });
+      screenshotChunksBase64.push({
+        heading: heading.text,
+        screenshot: Buffer.from(chunkBuf).toString("base64"),
+      });
+      lastY = heading.y;
+    }
+
     return {
       html,
       truncated,
       screenshotBase64,
       screenshotFoldBase64,
       screenshotWideBase64,
+      scrollHeight,
+      screenshotChunksBase64,
       domInfo: extracted.domInfo,
       computedStyles: extracted.computedStyles,
       imageUrls: extracted.uniqueImageUrls,
