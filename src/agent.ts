@@ -280,6 +280,11 @@ ${context.html}
   const sourceDomInfo = context.domInfo;
   let prevCompositeScore: number | null = null;
 
+  const STRUCTURE_ITERS_CAP = 20;
+  const CONTENT_ITERS_CAP = 2;
+  let structureItersUsed = 0;
+  let contentItersUsed = 0;
+
   if (savedPath) {
     for (let i = 0; i < MAX_ITER; i++) {
       console.log(`\n[fidelity] Iteration ${i + 1}/${MAX_ITER} — scoring...`);
@@ -293,7 +298,10 @@ ${context.html}
 
       // ── Level classification via DOM diff (no VLM cost) ──────────────────
       const domDiff = computeDomDiff(sourceDomInfo, genDomInfo);
-      const level: FidelityLevel = classifyLevel(domDiff);
+      const domLevel: FidelityLevel = classifyLevel(domDiff);
+      let level: FidelityLevel = domLevel;
+      if (level === "structure" && structureItersUsed >= STRUCTURE_ITERS_CAP) level = "content";
+      if (level === "content" && contentItersUsed >= CONTENT_ITERS_CAP) level = "visual";
 
       // ── VLM scoring only at visual level (fold screenshots for stability) ─
       let vlmScore: Awaited<ReturnType<typeof computeVlmFidelityScore>> | null = null;
@@ -316,8 +324,10 @@ ${context.html}
           vlmScore: vlmScore?.score ?? 0,
           vlmVerdict: vlmScore?.verdict ?? "distant",
           level,
+          domLevel,
           domScore: domDiff.score,
           compositeScore,
+          missingHeadingCount: domDiff.missingHeadings.length,
         },
       });
 
@@ -332,8 +342,9 @@ ${context.html}
         discrepancyCount: 0,
       };
 
+      const levelStr = level !== domLevel ? `${level} (forced from ${domLevel})` : level;
       console.log(
-        `[fidelity] Level: ${level} | DOM: ${domDiff.score.toFixed(3)} (hr=${domDiff.headingRetentionRatio.toFixed(2)} tc=${domDiff.textCoverageRatio.toFixed(2)})` +
+        `[fidelity] Level: ${levelStr} | DOM: ${domDiff.score.toFixed(3)} (hr=${domDiff.headingRetentionRatio.toFixed(2)} tc=${domDiff.textCoverageRatio.toFixed(2)})` +
           (level === "visual" && vlmScore ? ` | VLM: ${vlmScore.score.toFixed(3)} (${severity})` : "") +
           ` | Composite: ${compositeScore.toFixed(3)}`,
       );
@@ -356,51 +367,118 @@ ${context.html}
       const currentHtml = fs.readFileSync(currentFilePath, "utf-8");
       savedPath = null;
 
-      const fixSaveFile = betaZodTool({
-        name: "save_file",
-        description: "Save the fixed HTML page to disk.",
-        inputSchema: z.object({
-          filename: z.string().describe("Same kebab-case filename as the original."),
-          content: z.string().describe("The complete fixed HTML content of the page."),
-        }),
-        run: async (input) => {
-          const outPath = path.join(mainDir, input.filename);
-          fs.writeFileSync(outPath, input.content, "utf-8");
-          savedPath = outPath;
-          return JSON.stringify({ success: true, file_path: outPath });
-        },
-      });
+      const STRUCTURE_BATCH = 4;
+      const fixStart = Date.now();
 
-      let fixSystem: string;
-      let fixUserText: string;
-      let fixImageBase64: string;
-
-      const STRUCTURE_BATCH = 15;
       if (level === "structure") {
+        // Fragment-only pass: model emits new section HTML only, injected before </body>.
+        // Avoids rewriting the full document (~200KB) just to append 15 sections.
         const batch = domDiff.missingHeadings.slice(0, STRUCTURE_BATCH);
         const missingList = batch.join("\n");
         const remaining = domDiff.missingHeadings.length - batch.length;
-        console.log(`[fidelity] Structure pass — adding ${batch.length} of ${domDiff.missingHeadings.length} missing headings (${remaining} remaining)`);
-        fixSystem = `You are an expert front-end developer completing a partially-generated HTML page. Your ONLY task is to add the missing sections listed below in the correct order. Do NOT change any section that already exists. Use responsive Tailwind classes (max-w-* mx-auto, xl:/2xl: variants).`;
-        fixImageBase64 = sourceFoldBase64;
-        fixUserText = `The image above is the SOURCE page first fold. The HTML below is missing these sections — add them in the order they appear on the source page:
+        console.log(`[fidelity] Structure pass — appending ${batch.length} of ${domDiff.missingHeadings.length} sections (${remaining} remaining)`);
 
-<missing_sections>
-${missingList}
-</missing_sections>
-
-<current_html>
-${currentHtml}
-</current_html>`;
         iterRecord.discrepancyCount = domDiff.missingHeadings.length;
-      } else if (level === "content") {
-        // Level 2: fill copy and images into existing skeleton
-        console.log(
-          `[fidelity] Content pass — text coverage ${(domDiff.textCoverageRatio * 100).toFixed(0)}%, image delta ${domDiff.imageDelta}`,
-        );
-        fixSystem = `You are an expert front-end developer filling in missing content in a generated HTML page. Your ONLY task is to add missing copy and images. Do NOT change the layout, colours, or visual styling.`;
-        fixImageBase64 = sourceBase64;
-        fixUserText = `The image above is the full SOURCE page. The HTML below has the right structure but is missing content:
+        record.iterations.push(iterRecord);
+
+        // Provide the first 8 KB of the document as a style reference so the model
+        // can match colours, typography, and spacing without seeing the full HTML.
+        const styleContext = currentHtml.slice(0, 8000);
+
+        const saveFragment = betaZodTool({
+          name: "save_fragment",
+          description:
+            "Append new HTML section fragments before </body>. Call once with all new sections.",
+          inputSchema: z.object({
+            fragment: z
+              .string()
+              .describe(
+                "New <section>/<div> elements to insert before </body>. Must NOT contain <html>, <head>, or <body> tags.",
+              ),
+          }),
+          run: async (input) => {
+            const injected = currentHtml.replace(/(<\/body>)/i, `${input.fragment}\n$1`);
+            fs.writeFileSync(currentFilePath, injected, "utf-8");
+            savedPath = currentFilePath;
+            return JSON.stringify({ success: true });
+          },
+        });
+
+        const fixRunner = client.beta.messages.toolRunner({
+          model: "claude-sonnet-4-6",
+          max_tokens: 16384,
+          tools: [saveFragment],
+          tool_choice: { type: "tool", name: "save_fragment" },
+          stream: true,
+          max_iterations: 1,
+          system: `You are an expert front-end developer completing a partially-generated HTML page. Output ONLY the HTML fragments for the missing sections — do NOT output a full document, and do NOT include <html>, <head>, or <body> tags. Use responsive Tailwind classes matching the style context provided.`,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "image",
+                  source: { type: "base64", media_type: "image/png", data: sourceFoldBase64 },
+                },
+                {
+                  type: "text",
+                  text: `The image above is the SOURCE page. Generate HTML fragment(s) for these missing sections in the order they appear on the source page:\n\n<missing_sections>\n${missingList}\n</missing_sections>\n\nMatch the styling patterns from this existing page context:\n\n<style_context>\n${styleContext}\n</style_context>`,
+                },
+              ],
+            },
+          ],
+        });
+
+        const { tokensIn: fixIn, tokensOut: fixOut } = await renderStream(fixRunner);
+        const fixDurationMs = Date.now() - fixStart;
+        totalTokensIn += fixIn;
+        totalTokensOut += fixOut;
+
+        logger.log({
+          phase: "fix",
+          timestamp: Date.now(),
+          data: {
+            iteration: i + 1,
+            model: "claude-sonnet-4-6",
+            tokensIn: fixIn,
+            tokensOut: fixOut,
+            durationMs: fixDurationMs,
+            htmlSizeDelta: savedPath
+              ? fs.readFileSync(savedPath, "utf-8").length - currentHtml.length
+              : 0,
+          },
+        });
+
+        structureItersUsed++;
+      } else {
+        // Content and visual: full-page rewrite via save_file
+        const fixSaveFile = betaZodTool({
+          name: "save_file",
+          description: "Save the fixed HTML page to disk.",
+          inputSchema: z.object({
+            filename: z.string().describe("Same kebab-case filename as the original."),
+            content: z.string().describe("The complete fixed HTML content of the page."),
+          }),
+          run: async (input) => {
+            const outPath = path.join(mainDir, input.filename);
+            fs.writeFileSync(outPath, input.content, "utf-8");
+            savedPath = outPath;
+            return JSON.stringify({ success: true, file_path: outPath });
+          },
+        });
+
+        let fixSystem: string;
+        let fixUserText: string;
+        let fixImageBase64: string;
+
+        if (level === "content") {
+          // Level 2: fill copy and images into existing skeleton
+          console.log(
+            `[fidelity] Content pass — text coverage ${(domDiff.textCoverageRatio * 100).toFixed(0)}%, image delta ${domDiff.imageDelta}`,
+          );
+          fixSystem = `You are an expert front-end developer filling in missing content in a generated HTML page. Your ONLY task is to add missing copy and images. Do NOT change the layout, colours, or visual styling.`;
+          fixImageBase64 = sourceBase64;
+          fixUserText = `The image above is the full SOURCE page. The HTML below has the right structure but is missing content:
 - Text coverage: ${(domDiff.textCoverageRatio * 100).toFixed(0)}% of source (target ≥70%)
 - Image delta: ${domDiff.imageDelta} (negative = missing images)
 
@@ -409,33 +487,36 @@ Add missing body copy and images to match the source. Do not touch layout or sty
 <current_html>
 ${currentHtml}
 </current_html>`;
-        iterRecord.discrepancyCount = Math.round((1 - domDiff.textCoverageRatio) * 10);
-      } else {
-        // Level 3: visual fix using VLM discrepancy list
-        console.log(`[fidelity] Captioning discrepancies...`);
-        const discrepancies = await captionDiscrepancies(sourceFoldBase64, genFoldBase64, {
-          sourceWideBase64,
-          generatedWideBase64: genWideBase64,
-        });
-        iterRecord.discrepancyCount = discrepancies.length;
+          iterRecord.discrepancyCount = Math.round((1 - domDiff.textCoverageRatio) * 10);
+          contentItersUsed++;
+        } else {
+          // Level 3: visual fix using VLM discrepancy list
+          console.log(`[fidelity] Captioning discrepancies...`);
+          const discrepancies = await captionDiscrepancies(sourceFoldBase64, genFoldBase64, {
+            sourceWideBase64,
+            generatedWideBase64: genWideBase64,
+          });
+          iterRecord.discrepancyCount = discrepancies.length;
 
-        logger.log({
-          phase: "caption",
-          timestamp: Date.now(),
-          data: { iteration: i + 1, tokensIn: 0, tokensOut: 0, discrepancies },
-        });
+          logger.log({
+            phase: "caption",
+            timestamp: Date.now(),
+            data: { iteration: i + 1, tokensIn: 0, tokensOut: 0, discrepancies },
+          });
 
-        if (discrepancies.length === 0) {
-          console.log("[fidelity] No actionable discrepancies — stopping loop.");
-          record.iterations.push(iterRecord);
-          break;
-        }
+          if (discrepancies.length === 0) {
+            console.log("[fidelity] No actionable discrepancies — stopping loop.");
+            record.iterations.push(iterRecord);
+            break;
+          }
 
-        console.log(`[fidelity] ${discrepancies.length} discrepancies — visual fix pass...`);
-        const discrepancyList = discrepancies.map((d) => `[${d.severity}] ${d.section}: ${d.issue}`).join("\n");
-        fixSystem = `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. You will be shown the source page screenshot and a list of specific discrepancies. Fix ONLY the listed issues — do not modify sections that are already correct. All fixes must use responsive Tailwind classes that render correctly from 1280px through 2560px+; never use fixed pixel widths on containers.`;
-        fixImageBase64 = sourceFoldBase64;
-        fixUserText = `The image above is the SOURCE page you must match. The HTML below is the current reconstruction. Fix ONLY the discrepancies listed — do not change anything else.
+          console.log(`[fidelity] ${discrepancies.length} discrepancies — visual fix pass...`);
+          const discrepancyList = discrepancies
+            .map((d) => `[${d.severity}] ${d.section}: ${d.issue}`)
+            .join("\n");
+          fixSystem = `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. You will be shown the source page screenshot and a list of specific discrepancies. Fix ONLY the listed issues — do not modify sections that are already correct. All fixes must use responsive Tailwind classes that render correctly from 1280px through 2560px+; never use fixed pixel widths on containers.`;
+          fixImageBase64 = sourceFoldBase64;
+          fixUserText = `The image above is the SOURCE page you must match. The HTML below is the current reconstruction. Fix ONLY the discrepancies listed — do not change anything else.
 
 <discrepancies>
 ${discrepancyList}
@@ -444,54 +525,52 @@ ${discrepancyList}
 <current_html>
 ${currentHtml}
 </current_html>`;
-      }
+        }
 
-      record.iterations.push(iterRecord);
+        record.iterations.push(iterRecord);
 
-      const fixStart = Date.now();
-      const fixRunner = client.beta.messages.toolRunner({
-        model: "claude-sonnet-4-6",
-        max_tokens: level === "structure"
-          ? 65536
-          : estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"),
-        tools: [fixSaveFile],
-        tool_choice: { type: "tool", name: "save_file" },
-        stream: true,
-        max_iterations: 1,
-        system: fixSystem,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "image",
-                source: { type: "base64", media_type: "image/png", data: fixImageBase64 },
-              },
-              { type: "text", text: fixUserText },
-            ],
-          },
-        ],
-      });
-
-      const { tokensIn: fixIn, tokensOut: fixOut } = await renderStream(fixRunner);
-      const fixDurationMs = Date.now() - fixStart;
-      totalTokensIn += fixIn;
-      totalTokensOut += fixOut;
-
-      logger.log({
-        phase: "fix",
-        timestamp: Date.now(),
-        data: {
-          iteration: i + 1,
+        const fixRunner = client.beta.messages.toolRunner({
           model: "claude-sonnet-4-6",
-          tokensIn: fixIn,
-          tokensOut: fixOut,
-          durationMs: fixDurationMs,
-          htmlSizeDelta: savedPath
-            ? fs.readFileSync(savedPath, "utf-8").length - currentHtml.length
-            : 0,
-        },
-      });
+          max_tokens: estimateMaxTokens(currentHtml.length, "claude-sonnet-4-6"),
+          tools: [fixSaveFile],
+          tool_choice: { type: "tool", name: "save_file" },
+          stream: true,
+          max_iterations: 1,
+          system: fixSystem,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "image",
+                  source: { type: "base64", media_type: "image/png", data: fixImageBase64 },
+                },
+                { type: "text", text: fixUserText },
+              ],
+            },
+          ],
+        });
+
+        const { tokensIn: fixIn, tokensOut: fixOut } = await renderStream(fixRunner);
+        const fixDurationMs = Date.now() - fixStart;
+        totalTokensIn += fixIn;
+        totalTokensOut += fixOut;
+
+        logger.log({
+          phase: "fix",
+          timestamp: Date.now(),
+          data: {
+            iteration: i + 1,
+            model: "claude-sonnet-4-6",
+            tokensIn: fixIn,
+            tokensOut: fixOut,
+            durationMs: fixDurationMs,
+            htmlSizeDelta: savedPath
+              ? fs.readFileSync(savedPath, "utf-8").length - currentHtml.length
+              : 0,
+          },
+        });
+      }
 
       if (!savedPath) {
         console.log("[fidelity] Fix pass did not save a file — stopping loop.");

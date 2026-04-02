@@ -36,8 +36,10 @@ export interface DiffData {
   vlmScore: number;
   vlmVerdict: VlmVerdict;
   level?: FidelityLevel;
+  domLevel?: FidelityLevel;
   domScore?: number;
   compositeScore?: number;
+  missingHeadingCount?: number;
 }
 
 export interface CaptionData {
