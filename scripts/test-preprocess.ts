@@ -2,15 +2,15 @@
  * Preprocessing layer test script.
  *
  * Usage:
- *   npx tsx scripts/test-preprocess.ts <url> [--out <dir>]
+ *   npx tsx scripts/test-preprocess.ts <url> [--name <label>] [--out <dir>]
  *
  * Runs crawlAndPreprocess() in isolation and writes:
  *   <out>/arch.json          — full CrawlResult (sans screenshot buffers)
  *   <out>/screenshot.png     — full-page screenshot
- *   <out>/sections/<slug>-0.png, <slug>-1.png, ...  — per-section screenshots
+ *   <out>/sections/<slug>-0.png  — per-section screenshots (stitched for tall sections)
  *   <out>/report.html        — visual HTML report
  *
- * Defaults to out = /tmp/preprocess-test-<timestamp>
+ * Defaults to out = output/<timestamp>-<name|preprocess-test>/
  */
 
 import * as fs from "fs";
@@ -23,14 +23,19 @@ const args = process.argv.slice(2);
 const urlArg = args.find((a) => !a.startsWith("--"));
 const outIndex = args.indexOf("--out");
 const outArg = outIndex !== -1 ? args[outIndex + 1] : undefined;
+const nameIndex = args.indexOf("--name");
+const nameArg = nameIndex !== -1 ? args[nameIndex + 1] : undefined;
 
 if (!urlArg) {
-  console.error("Usage: npx tsx scripts/test-preprocess.ts <url> [--out <dir>]");
+  console.error("Usage: npx tsx scripts/test-preprocess.ts <url> [--name <label>] [--out <dir>]");
   process.exit(1);
 }
 
 async function main() {
-const outDir = outArg ?? path.join(path.resolve(__dirname, "../output"), `${Date.now()}-preprocess-test`);
+const slug = nameArg
+  ? nameArg.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
+  : "preprocess-test";
+const outDir = outArg ?? path.join(path.resolve(__dirname, "../output"), `${Date.now()}-${slug}`);
 fs.mkdirSync(path.join(outDir, "sections"), { recursive: true });
 
 // ── Run ───────────────────────────────────────────────────────────────────────
@@ -138,7 +143,7 @@ const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Preprocess Test — ${escHtml(urlArg)}</title>
+  <title>Preprocess Test — ${escHtml(urlArg!)}</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #e5e7eb; padding: 2rem; line-height: 1.5; }
@@ -152,8 +157,8 @@ const html = `<!DOCTYPE html>
 </head>
 <body>
   <div style="margin-bottom:1.5rem">
-    <h1>Preprocessing Test</h1>
-    <p style="color:#9ca3af;font-size:0.85rem;margin-top:0.25rem">${escHtml(urlArg)}</p>
+    <h1>${nameArg ? escHtml(nameArg) : "Preprocessing Test"}</h1>
+    <p style="color:#9ca3af;font-size:0.85rem;margin-top:0.25rem">${escHtml(urlArg!)}</p>
   </div>
 
   <div class="grid">

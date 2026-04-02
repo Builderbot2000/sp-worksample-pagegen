@@ -71,6 +71,23 @@ npm run format         # format with prettier
 npm run format:check   # check formatting
 ```
 
+### Preprocessing test
+
+Runs `crawlAndPreprocess()` in isolation and writes a visual report showing the detected sections, per-section screenshots, crawl metadata, and extracted styles — without invoking the LLM.
+
+```sh
+npm run test:preprocess -- <url>
+npm run test:preprocess -- <url> --name <label>
+npm run test:preprocess -- <url> --name <label> --out <dir>
+```
+
+Output goes to `output/<timestamp>-<name|preprocess-test>/` and includes `arch.json`, `screenshot.png`, `sections/`, and `report.html`.
+
+```sh
+# Example
+npm run test:preprocess -- https://stripe.com/payments --name stripe-payments
+```
+
 ## The Challenge
 
 Improve the **fidelity** of generated pages. The output should closely match the source page across four dimensions:
