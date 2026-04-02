@@ -130,14 +130,55 @@ Conclusion: Fragment injection is not viable for the structure pass. Full-docume
 **Issue 1: Structure level exhausts the full iteration budget.** ✓ Resolved via per-level caps and `--quality` auto-budget. The `computeIterBudget` function sizes structure passes as `ceil(sourceHeadings × 0.8 / batch)`, ensuring the structure level completes before content and visual passes run. Needs re-validation with full-pass architecture.
 
 **Issue 2: Structure fix pass rewrites the entire HTML document.**
-Fragment injection (run 9) was attempted as the fix and caused significant quality regression. The correct approach is full-document rewrite retained, with cost reduction explored via a smaller model for structure passes or structured-edit output (model emits targeted insertion instructions rather than full HTML). Open.
+Fragment injection (run 9) was attempted as the fix and caused significant quality regression. The correct approach is full-document rewrite retained, with cost reduction explored via a smaller model for structure passes or structured-edit output (model emits targeted insertion instructions rather than full HTML). Partially addressed in run 10 — see below.
 
 **Issue 3: Below-fold content score plateau in the old VLM loop.** ✓ Resolved by the DOM-tiered dispatch introduced in run 8. Run 9 regressed due to the fragment approach, not the tier architecture.
 
 **Issue 4: `summary.json` / `run.json` serialisation corruption.**
 Previously hypothesised to be caused by raw heading strings in the logged iteration record. More likely the actual cause is thumbnail base64 image data being embedded directly in `summary.json` — observed in recent runs where the file is abnormally large. The `missingHeadings` array was already excluded from `iterRecord`; the thumbnail fields in `BaselineComparison` are the probable culprit. Fix: strip thumbnail base64 from `summary.json` (keep in `run.json` only; or write thumbnails to separate files). Open.
 
+---
+
+### 10. `model-switch` — 1775106809831
+
+Swapped generation model from Haiku to Sonnet and fix model from Sonnet to Haiku. Ran with `--fidelity balanced --baseline` (4 iterations, structure batch 15, wide viewport). Cost accounting also corrected to price the two token pools at their actual model rates rather than both at Sonnet pricing.
+
+**Per-phase breakdown:**
+
+| Phase | Model | Duration | Tokens in | Tokens out |
+|---|---|---|---|---|
+| Generate | Sonnet | 4m 36s | 35 160 | 18 299 |
+| Fix ×1 | Haiku | 2m 26s | 20 714 | 18 722 |
+| Fix ×2 | Haiku | 2m 27s | 21 220 | 18 786 |
+| Fix ×3 | Haiku | 3m 22s | 21 269 | 18 820 |
+
+All 4 iterations were structure-level. Iteration 4 found 0 missing headings (prior pass exhausted the batch list) and ran a no-op fix before stopping.
+
+Main: **VLM 0.62** · **DOM 0.343** · Cost: **$0.656** · Duration: **13.5m** · Baseline VLM: 0.20
+
+| Metric | Run 10 (model-switch) | Run 8 (dom-based) | Δ |
+|---|---|---|---|
+| VLM score | 0.620 | 0.620 | 0% |
+| DOM score | 0.343 | 0.789 | −56% |
+| Heading retention | 39.7% | ~80%+ | −40pp |
+| Cost | $0.656 | $3.165 | −79% |
+| Duration | 13.5m | 36.1m | −63% |
+
+**Observations:**
+VLM parity with run 8 is misleading — it measures only the first fold, which Sonnet's higher-quality generation pass covered well. The DOM score regressed sharply: Haiku's structure fix passes only reached headingRetentionRatio 0.397 vs run 8's ~0.80+, covering 23 of 78 required headings after 3 effective passes (batch 15 × 3 = 45 headings nominally addressed, but retention suggests fewer were preserved correctly across rewrites). The loop never advanced past structure level.
+
+The cost and time reductions are real and large — 79% cheaper, 63% faster — but below-fold coverage is the casualty. The VLM score masks this because the fold is visually reasonable from Sonnet's generation pass alone.
+
+Conclusion: Haiku is not adequate for structure fix passes on a page of this complexity. Its full-document rewrites preserve fewer of the existing sections as context grows across iterations — each pass is nominally adding the new batch but dropping previously-added content. The fix model for structure passes needs to be Sonnet (or the problem approached differently). Generation model upgrade to Sonnet is confirmed beneficial and should be retained.
+
+---
+
+## Known Issues & Next Steps
+
+**Issue 5: Haiku structure fix passes degrade DOM coverage.**
+Haiku loses previously-added content across full-document rewrites on large, complex pages. Run 10 confirms this definitively. Structure fix passes must use Sonnet. Generation passes should remain on Sonnet (run 10 confirms the quality floor is maintained). Fix model assignment should be level-aware: Sonnet for structure and content passes, Haiku acceptable only for visual passes (smaller, more targeted diffs).
+
 **Planned next iteration:**
-- Revert structure pass to full-document rewrite (restore run 8 approach)
-- Re-run with `--quality balanced` to validate iteration budget against full-pass architecture
+- Restore Sonnet for structure (and content) fix passes; retain Haiku only for visual fix passes
+- Re-run `--fidelity balanced` to validate DOM coverage recovers to run 8 levels at reasonable cost
 - Fix `summary.json` thumbnail serialisation (strip `mainThumbnail` / `baselineThumbnail` base64 from summary)
