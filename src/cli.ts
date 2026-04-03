@@ -23,6 +23,7 @@ const program = new Command()
     },
   )
   .option("--baseline", "Also run the baseline agent for comparison")
+  .option("--correction", "Run per-section correction loop after initial generation")
   .option("--open", "Open the generated file in the default browser")
   .action(async (url: string, opts: GenerateOptions & { open?: boolean }) => {
     const savedPath = await generatePage(url, opts);

@@ -89,6 +89,8 @@ export interface SectionComparisonResult {
   matched: number;
   unmatched: number;
   aggregateScore: number;
+  tokensIn: number;
+  tokensOut: number;
 }
 
 // ─── Compute section discrepancies ───────────────────────────────────────────
@@ -124,6 +126,9 @@ export async function computeSectionDiscrepancies(
   // Subsample to stay within VLM batch budget
   const toScore = matchedSlugs.slice(0, MAX_SECTION_PAIRS);
 
+  let tokensIn = 0;
+  let tokensOut = 0;
+
   if (toScore.length > 0) {
     const userContent: Anthropic.MessageParam["content"] = [];
     for (const slug of toScore) {
@@ -153,10 +158,13 @@ export async function computeSectionDiscrepancies(
       const response = await client.messages.create({
         model: "claude-sonnet-4-6",
         max_tokens: opts?.maxTokens ?? 512 + 256 * toScore.length,
+        temperature: 0,
         system: SECTION_VLM_SYSTEM,
         messages: [{ role: "user", content: userContent }],
       });
 
+      tokensIn = response.usage.input_tokens;
+      tokensOut = response.usage.output_tokens;
       const text = response.content.find((b) => b.type === "text")?.text ?? "";
       const cleaned = text.replace(/^```[^\n]*\n?|```$/gm, "").trim();
       const parsed = JSON.parse(cleaned) as unknown[];
@@ -166,6 +174,8 @@ export async function computeSectionDiscrepancies(
           if (typeof d !== "object" || d === null || !("slug" in d) || !("score" in d) || !("verdict" in d))
             continue;
           const item = d as { slug: string; score: number; verdict: string; issues?: unknown[] };
+          // VLM receives labels like "section-1 (hero)" and echoes them back — strip the role suffix
+          const slug = item.slug.replace(/\s*\([^)]*\)\s*$/, "").trim();
           const score = Math.max(0, Math.min(1, Number(item.score)));
           const verdict: VlmVerdict = ["close", "partial", "distant"].includes(item.verdict)
             ? (item.verdict as VlmVerdict)
@@ -173,10 +183,10 @@ export async function computeSectionDiscrepancies(
           const issues = Array.isArray(item.issues)
             ? (item.issues as unknown[]).filter((s): s is string => typeof s === "string").slice(0, 3)
             : [];
-          sectionScores[item.slug] = score;
+          sectionScores[slug] = score;
           if (verdict !== "close") {
             discrepancies.push({
-              slug: item.slug,
+              slug,
               type: "visual",
               severity: verdict === "distant" ? "high" : "medium",
               issues,
@@ -220,6 +230,8 @@ export async function computeSectionDiscrepancies(
     matched: matchedSlugs.length,
     unmatched: unmatchedSlugs.length,
     aggregateScore,
+    tokensIn,
+    tokensOut,
   };
 }
 
@@ -229,67 +241,6 @@ export function scoreSeverity(score: number): "high" | "medium" | "low" {
   if (score > 0.85) return "low";
   if (score >= 0.6) return "medium";
   return "high";
-}
-
-// ─── Full-page VLM scorer (baseline comparison only) ─────────────────────────
-
-const FULL_PAGE_VLM_SYSTEM = `You are a visual fidelity judge. You will be shown two screenshots of web pages: the SOURCE (original) and the RECONSTRUCTION (generated). Your task is to assess how closely the reconstruction matches the source.
-
-Respond with ONLY a JSON object — no prose, no markdown fences. The shape must be:
-{
-  "verdict": "close" | "partial" | "distant",
-  "score": <number 0.0–1.0>,
-  "sections": {
-    "header": "match" | "partial" | "missing",
-    "navigation": "match" | "partial" | "missing",
-    "hero": "match" | "partial" | "missing",
-    "content": "match" | "partial" | "missing",
-    "footer": "match" | "partial" | "missing"
-  },
-  "issues": [<brief string per problem, max 5>]
-}
-
-Scoring guide:
-- 0.9–1.0 / "close": layout, colours, typography, and content are essentially identical
-- 0.6–0.89 / "partial": overall structure matches but notable visual differences exist
-- 0.0–0.59 / "distant": substantially different layout or content`;
-
-async function computeFullPageVlmScore(
-  sourceBase64: string,
-  generatedBase64: string,
-): Promise<VlmFidelityScore> {
-  const FALLBACK: VlmFidelityScore = { verdict: "distant", score: 0, sections: {}, issues: ["VLM scoring failed"] };
-  try {
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1024,
-      system: FULL_PAGE_VLM_SYSTEM,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: sourceBase64 } },
-            { type: "text", text: "SOURCE screenshot above." },
-            { type: "image", source: { type: "base64", media_type: "image/png", data: generatedBase64 } },
-            { type: "text", text: "RECONSTRUCTION screenshot above. Evaluate fidelity and respond with the JSON object only." },
-          ],
-        },
-      ],
-    });
-    const text = response.content.find((b) => b.type === "text")?.text ?? "";
-    const cleaned = text.replace(/^```[^\n]*\n?|```$/gm, "").trim();
-    const parsed = JSON.parse(cleaned) as VlmFidelityScore;
-    if (typeof parsed.score !== "number" || !["close", "partial", "distant"].includes(parsed.verdict))
-      return FALLBACK;
-    return {
-      verdict: parsed.verdict,
-      score: Math.max(0, Math.min(1, parsed.score)),
-      sections: parsed.sections ?? {},
-      issues: Array.isArray(parsed.issues) ? parsed.issues.slice(0, 5) : [],
-    };
-  } catch {
-    return FALLBACK;
-  }
 }
 
 // ─── Full-page screenshot helper ──────────────────────────────────────────────
@@ -328,7 +279,7 @@ export async function collectFidelityMetrics(
   archDoc: VisualArchDoc,
   mainFilePath: string,
   baselineFilePath?: string,
-): Promise<FidelityMetrics> {
+): Promise<{ metrics: FidelityMetrics; tokensIn: number; tokensOut: number }> {
   console.log("[fidelity] Computing final fidelity metrics...");
   const start = Date.now();
 
@@ -352,14 +303,10 @@ export async function collectFidelityMetrics(
   if (baselineFilePath) {
     const baselineScreenshotBuf = await screenshotFile(baselineFilePath);
     metrics.baselineScreenshotBase64 = baselineScreenshotBuf.toString("base64");
-    metrics.baselineVlmScore = await computeFullPageVlmScore(
-      sourceMeta.screenshotBase64,
-      metrics.baselineScreenshotBase64,
-    );
   }
 
   console.log(`[fidelity] Done in ${((Date.now() - start) / 1000).toFixed(1)}s`);
-  return metrics;
+  return { metrics, tokensIn: mainResult.tokensIn, tokensOut: mainResult.tokensOut };
 }
 
 // ─── Build VlmFidelityScore from section comparison ──────────────────────────

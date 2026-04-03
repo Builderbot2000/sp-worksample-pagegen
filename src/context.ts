@@ -37,6 +37,8 @@ export interface CrawlResult {
   sourceSectionScreenshots: Record<string, Buffer[]>;
   /** outerHTML of top-level fixed/sticky elements, truncated to 3 KB each. */
   fixedElementsHtml: string[];
+  captionTokensIn: number;
+  captionTokensOut: number;
 }
 
 // ─── Main crawl function ──────────────────────────────────────────────────────
@@ -256,6 +258,8 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
     // description that enumerates every distinct content block in the section.
     console.log(`[preprocess] Captioning ${dedupedSections.length} sections...`);
     const captionMap = new Map<string, string>();
+    let captionTokensIn = 0;
+    let captionTokensOut = 0;
     await Promise.all(
       dedupedSections.map(async (sec) => {
         const bufs = sourceSectionScreenshots[sec.slug];
@@ -281,6 +285,8 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
               },
             ],
           });
+          captionTokensIn += resp.usage.input_tokens;
+          captionTokensOut += resp.usage.output_tokens;
           const text = resp.content.find((b) => b.type === "text")?.text?.trim();
           if (text) captionMap.set(sec.slug, text);
         } catch {
@@ -356,6 +362,8 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
       visualArchDoc: { sections: archDocSections, fixedElements, backgroundDescription: "" },
       sourceSectionScreenshots,
       fixedElementsHtml,
+      captionTokensIn,
+      captionTokensOut,
     };
   } finally {
     await browser.close();

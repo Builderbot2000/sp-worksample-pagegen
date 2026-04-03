@@ -9,7 +9,7 @@ import { crawlAndPreprocess } from "./context";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
 import { estimateCost, estimateMaxTokens } from "./observability/metrics";
-import { collectFidelityMetrics } from "./observability/fidelity";
+import { collectFidelityMetrics, screenshotSectionsBySlug, computeSectionDiscrepancies, scoreSeverity } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
 import type { RunRecord, FidelityMode, VisualArchDoc } from "./observability/types";
 
@@ -23,14 +23,16 @@ const client = new Anthropic();
 export interface FidelityBudget {
   /** Hard cap for initial generation. null = use estimateMaxTokens() dynamically. */
   generateMaxTokens: number | null;
+  /** Max correction iterations per section. 0 = no correction loop. */
+  maxSectionIter: number;
 }
 
 const FIDELITY_BUDGETS: Record<FidelityMode, FidelityBudget> = {
-  minimal:  { generateMaxTokens: 8_000  },
-  fast:     { generateMaxTokens: 12_000 },
-  balanced: { generateMaxTokens: null   },
-  high:     { generateMaxTokens: null   },
-  maximal:  { generateMaxTokens: null   },
+  minimal:  { generateMaxTokens: 8_000,  maxSectionIter: 0 },
+  fast:     { generateMaxTokens: 12_000, maxSectionIter: 1 },
+  balanced: { generateMaxTokens: null,   maxSectionIter: 2 },
+  high:     { generateMaxTokens: null,   maxSectionIter: 3 },
+  maximal:  { generateMaxTokens: null,   maxSectionIter: 4 },
 };
 
 const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
@@ -39,6 +41,7 @@ export interface GenerateOptions {
   name?: string;
   fidelity?: FidelityMode;
   baseline?: boolean;
+  correction?: boolean;
   open?: boolean;
 }
 
@@ -122,12 +125,18 @@ function extractRootCssVars(html: string): string {
  * Extract the opening tag of a section shell from the skeleton HTML.
  * Returns just the opening tag string, e.g. `<section class="bg-[#0a2540] py-24" data-section-slug="hero">`.
  */
-function extractShellTag(skeletonHtml: string, slug: string): string | undefined {
+export function extractShellTag(skeletonHtml: string, slug: string): string | undefined {
   const escapedSlug = slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = skeletonHtml.match(
     new RegExp(`<[a-zA-Z][a-zA-Z0-9]*(?:[^>]*)data-section-slug="${escapedSlug}"(?:[^>]*)>`),
   );
   return match?.[0];
+}
+
+/** Wrap a filled fragment inside its shell opening tag to give neighbours real rendered HTML. */
+export function assembleNeighbour(shellTag: string, fragment: string): string {
+  const tagName = shellTag.match(/^<([a-zA-Z][a-zA-Z0-9]*)/)?.[1] ?? "div";
+  return `${shellTag}\n${fragment}\n</${tagName}>`;
 }
 
 export async function generateSection(
@@ -140,6 +149,9 @@ export async function generateSection(
   url: string,
   cssVars?: string,
   shellContext?: { self: string; prev?: string; next?: string },
+  corrections?: string[],
+  currentScreenshot?: Buffer,
+  currentHtml?: string,
 ): Promise<{ slug: string; fragment: string; tokensIn: number; tokensOut: number }> {
   let fragment: string | null = null;
 
@@ -176,15 +188,24 @@ export async function generateSection(
     });
   }
 
+  if (currentScreenshot) {
+    const resized = await resizeForVlm(currentScreenshot);
+    contentBlocks.push({ type: "text", text: `The image below is the CURRENT (incorrect) reconstruction of section "${section.slug}" — use it to understand exactly what went wrong and how it differs from the source above.` });
+    contentBlocks.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data: resized.toString("base64") },
+    });
+  }
+
   const shellContextBlock = shellContext
     ? `<shell_context>
 Your section's shell element (already in the DOM — do NOT redeclare its tag, background, or padding):
 ${shellContext.self}${shellContext.prev ? `
 
-Shell of the section immediately above yours:
+The section immediately above yours in the assembled page:
 ${shellContext.prev}` : ""}${shellContext.next ? `
 
-Shell of the section immediately below yours:
+The section immediately below yours in the assembled page:
 ${shellContext.next}` : ""}
 </shell_context>\n\n`
     : "";
@@ -218,7 +239,11 @@ ${fontsText}
 <image_urls>
 ${imageUrlsText}
 </image_urls>
-
+${corrections && corrections.length > 0
+    ? `\n<corrections>\nThe previous attempt had these visual issues — fix them:\n${corrections.map(i => `- ${i}`).join("\n")}\n</corrections>\n`
+    : ""}${currentHtml
+    ? `\n<current_html>\nThis is the HTML fragment currently rendered in the reconstruction above. Modify it surgically to fix the listed issues rather than rewriting from scratch — keep everything that already matches the source.\n${currentHtml}\n</current_html>\n`
+    : ""}
 Generate the fragment now using the save_section tool.`,
   });
 
@@ -316,6 +341,10 @@ ${truncatedHtml}
   return { savedPath, tokensIn, tokensOut, durationMs: Date.now() - start };
 }
 
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 export async function generatePage(url: string, opts: GenerateOptions = {}): Promise<string | null> {
   const startedAt = Date.now();
   const runId = `${startedAt}-${opts.name ? slugify(opts.name) : urlSlug(url)}`;
@@ -348,6 +377,17 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
       fidelityMode: opts.fidelity ?? "balanced",
     },
   });
+
+  // ─── Run record ──────────────────────────────────────────────────────────────
+  const record: RunRecord = {
+    runId,
+    ...(opts.name ? { name: opts.name } : {}),
+    url,
+    startedAt,
+    completedAt: 0,
+    iterations: [],
+    estimatedCostUsd: 0,
+  };
 
   const generateStart = Date.now();
 
@@ -499,6 +539,8 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
   let sectionFragments: { slug: string; fragment: string }[] = [];
   let sectionTokensIn = 0;
   let sectionTokensOut = 0;
+  let scorerTokensIn = 0;
+  let scorerTokensOut = 0;
 
   if (skeletonHtml) {
     const skeleton = skeletonHtml;
@@ -546,6 +588,199 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
     fs.writeFileSync(assembledPath, assembledHtml, "utf-8");
     savedPath = assembledPath;
     console.log(`[gen] Assembled — ${assembledPath}`);
+
+    // ── Stage 2.5: Per-section correction loop ────────────────────────────
+    if (opts.correction && budget.maxSectionIter > 0) {
+      const CORRECTION_THRESHOLD = 0.85;
+      const PLATEAU_DELTA = 0.01;
+      const fragmentMap = new Map(sectionFragments.map((f) => [f.slug, f.fragment]));
+      let prevScore = 0;
+      const correctionsDir = path.join(runDir, "corrections");
+      const sectionsDir = path.join(runDir, "sections");
+
+      // Save source screenshots once so the HTML reports can reference them
+      fs.mkdirSync(sectionsDir, { recursive: true });
+      for (const section of archDoc.sections) {
+        const bufs = crawlResult.sourceSectionScreenshots[section.slug];
+        if (bufs?.[0]) fs.writeFileSync(path.join(sectionsDir, `source-${section.slug}.png`), bufs[0]);
+      }
+
+      for (let iter = 1; iter <= budget.maxSectionIter; iter++) {
+        const genScreenshots = await screenshotSectionsBySlug({ file: assembledPath }, archDoc);
+
+        // Save per-iter generated screenshots
+        const iterScreenshotsDir = path.join(correctionsDir, `iter-${iter}`);
+        fs.mkdirSync(iterScreenshotsDir, { recursive: true });
+        for (const [slug, bufs] of Object.entries(genScreenshots)) {
+          if (bufs[0]) fs.writeFileSync(path.join(iterScreenshotsDir, `generated-${slug}.png`), bufs[0]);
+        }
+
+        const result = await computeSectionDiscrepancies(
+          crawlResult.sourceSectionScreenshots,
+          genScreenshots,
+          archDoc,
+        );
+        scorerTokensIn += result.tokensIn;
+        scorerTokensOut += result.tokensOut;
+        const sectionsToFix = result.discrepancies.filter((d) => (d.score ?? 0) < CORRECTION_THRESHOLD);
+        const slugsToFix = new Set(sectionsToFix.map((d) => d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim()));
+        console.log(
+          `[correct] iter ${iter}/${budget.maxSectionIter} — score ${result.aggregateScore.toFixed(2)}, ` +
+          `fixing ${sectionsToFix.length} sections: [${[...slugsToFix].join(", ")}]`,
+        );
+
+        // Write per-iteration HTML report
+        const iterReportPath = path.join(correctionsDir, `iter-${iter}-report.html`);
+        const iterSectionCards = archDoc.sections.map((s) => {
+          const disc = result.discrepancies.find(
+            (d) => d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim() === s.slug,
+          );
+          const score = disc?.score ?? 1;
+          const severity = score >= 0.85 ? "low" : score >= 0.6 ? "medium" : "high";
+          const isFixed = slugsToFix.has(s.slug);
+          const scoreColor = score >= 0.85 ? "#34d399" : score >= 0.6 ? "#fbbf24" : "#f87171";
+          const sourceImg = path.relative(correctionsDir, path.join(sectionsDir, `source-${s.slug}.png`));
+          const genImg = `iter-${iter}/generated-${s.slug}.png`;
+          const hasSource = fs.existsSync(path.join(sectionsDir, `source-${s.slug}.png`));
+          const hasGen = fs.existsSync(path.join(iterScreenshotsDir, `generated-${s.slug}.png`));
+          return `<div class="section-card${isFixed ? " fixing" : ""}">
+  <div class="section-header">
+    <span class="section-slug">${escHtml(s.slug)}</span>
+    <span class="section-role">${escHtml(s.role)}</span>
+    <span class="score-badge" style="background:${scoreColor}20;color:${scoreColor};border:1px solid ${scoreColor}40">${(score * 100).toFixed(0)}% ${escHtml(severity)}</span>
+    ${isFixed ? `<span class="badge fixing-badge">FIXING</span>` : ""}
+  </div>
+  ${disc?.issues?.length ? `<ul class="issues-list">${disc.issues.map((i) => `<li>${escHtml(i)}</li>`).join("")}</ul>` : ""}
+  <div class="section-screenshots">
+    <div class="screenshot-col">
+      <div class="screenshot-label">Source</div>
+      ${hasSource ? `<img src="${escHtml(sourceImg)}" />` : `<div class="screenshot-missing">No source</div>`}
+    </div>
+    <div class="screenshot-col">
+      <div class="screenshot-label">Generated (iter ${iter})</div>
+      ${hasGen ? `<img src="${escHtml(genImg)}" />` : `<div class="screenshot-missing">No screenshot</div>`}
+    </div>
+  </div>
+</div>`;
+        }).join("\n");
+        const iterReportHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Correction iter ${iter} — ${escHtml(url)}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #e5e7eb; padding: 2rem; line-height: 1.5; }
+    h1 { font-size: 1.1rem; font-weight: 700; color: #f9fafb; margin-bottom: 0.25rem; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+    .score-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.7rem; font-weight: 700; }
+    .fixing-badge { background: #78350f; color: #fbbf24; }
+    .section-card { background: #1f2937; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }
+    .section-card.fixing { border-left: 3px solid #fbbf24; }
+    .section-header { display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+    .section-slug { font-family: monospace; font-size: 0.9rem; color: #60a5fa; font-weight: 600; }
+    .section-role { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; background: #374151; color: #d1d5db; padding: 0.15rem 0.5rem; border-radius: 3px; }
+    .issues-list { font-size: 0.8rem; color: #fca5a5; margin: 0.5rem 0 0.75rem 1rem; }
+    .issues-list li + li { margin-top: 0.25rem; }
+    .section-screenshots { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 0.75rem; }
+    .screenshot-col { display: flex; flex-direction: column; gap: 0.5rem; }
+    .screenshot-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; }
+    .screenshot-col img { width: 100%; border-radius: 4px; border: 1px solid #374151; display: block; }
+    .screenshot-missing { font-size: 0.8rem; color: #6b7280; padding: 1rem; background: #111827; border-radius: 4px; text-align: center; }
+    .stat { display: inline-block; margin-right: 1.5rem; font-size: 0.85rem; color: #d1d5db; }
+    .stat span { font-weight: 700; color: #f9fafb; }
+  </style>
+</head>
+<body>
+  <h1>Correction Iteration ${iter}/${budget.maxSectionIter}</h1>
+  <p style="color:#9ca3af;font-size:0.85rem;margin-top:0.25rem;margin-bottom:1.25rem">${escHtml(url)}</p>
+  <div style="margin-bottom:1.5rem">
+    <span class="stat">Aggregate score <span>${(result.aggregateScore * 100).toFixed(1)}%</span></span>
+    <span class="stat">Matched <span>${result.matched}</span></span>
+    <span class="stat">Unmatched <span>${result.unmatched}</span></span>
+    <span class="stat">Fixing <span>${sectionsToFix.length}</span></span>
+  </div>
+  ${iterSectionCards}
+</body>
+</html>`;
+        fs.writeFileSync(iterReportPath, iterReportHtml);
+        console.log(`[correct] iter ${iter} report — ${path.relative(runDir, iterReportPath)}`);
+
+        if (sectionsToFix.length === 0) break;
+        if (iter > 1 && result.aggregateScore - prevScore < PLATEAU_DELTA) {
+          console.log(`[correct] Plateau detected — stopping.`);
+          break;
+        }
+        prevScore = result.aggregateScore;
+
+        const correctionResults = await Promise.all(
+          sectionsToFix.map((d) => {
+            const baseSlug = d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim();
+            const section = archDoc.sections.find((s) => s.slug === baseSlug);
+            if (!section) return Promise.resolve({ slug: baseSlug, fragment: "", tokensIn: 0, tokensOut: 0 });
+            const i = archDoc.sections.indexOf(section);
+            const selfTag = extractShellTag(skeleton, section.slug);
+            const prevSlug = archDoc.sections[i - 1]?.slug;
+            const nextSlug = archDoc.sections[i + 1]?.slug;
+            const prevShell = prevSlug ? extractShellTag(skeleton, prevSlug) : undefined;
+            const nextShell = nextSlug ? extractShellTag(skeleton, nextSlug) : undefined;
+            const prevTag = prevShell
+              ? assembleNeighbour(prevShell, fragmentMap.get(prevSlug!) ?? "")
+              : undefined;
+            const nextTag = nextShell
+              ? assembleNeighbour(nextShell, fragmentMap.get(nextSlug!) ?? "")
+              : undefined;
+            const shellCtx = selfTag ? { self: selfTag, prev: prevTag, next: nextTag } : undefined;
+            return generateSection(
+              section,
+              { prev: archDoc.sections[i - 1]?.slug, next: archDoc.sections[i + 1]?.slug },
+              crawlResult.sourceSectionScreenshots[section.slug] ?? [],
+              crawlResult.computedStyles,
+              crawlResult.fontFamilies,
+              crawlResult.imageUrls,
+              url,
+              rootCssVars || undefined,
+              shellCtx,
+              d.issues,
+              genScreenshots[section.slug]?.[0],
+              fragmentMap.get(baseSlug),
+            );
+          }),
+        );
+
+        for (const r of correctionResults) {
+          fragmentMap.set(r.slug, r.fragment);
+          sectionTokensIn += r.tokensIn;
+          sectionTokensOut += r.tokensOut;
+        }
+
+        const reassembled = assembleSkeleton(
+          skeleton,
+          [...fragmentMap].map(([slug, fragment]) => ({ slug, fragment })),
+        );
+        fs.writeFileSync(assembledPath, reassembled, "utf-8");
+
+        logger.log({
+          phase: "diff",
+          timestamp: Date.now(),
+          data: {
+            iteration: iter,
+            vlmScore: result.aggregateScore,
+            matched: result.matched,
+            unmatched: result.unmatched,
+            discrepancyCount: result.discrepancies.length,
+          },
+        });
+        record.iterations.push({
+          iteration: iter,
+          matched: result.matched,
+          unmatched: result.unmatched,
+          vlmScore: result.aggregateScore,
+          severity: scoreSeverity(result.aggregateScore),
+          discrepancyCount: result.discrepancies.length,
+        });
+      }
+    }
   }
 
   const generateDurationMs = Date.now() - generateStart;
@@ -565,20 +800,12 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
   const generateTokensIn = skeletonIn + sectionTokensIn;
   const generateTokensOut = skeletonOut + sectionTokensOut;
 
-  // ─── Run record ──────────────────────────────────────────────────────────────
-  const record: RunRecord = {
-    runId,
-    ...(opts.name ? { name: opts.name } : {}),
-    url,
-    startedAt,
-    completedAt: 0,
-    iterations: [],
-    estimatedCostUsd: 0,
-  };
-
   // ─── Cost + record finalisation ─────────────────────────────────────────────
   record.completedAt = Date.now();
-  record.estimatedCostUsd = estimateCost(GENERATE_MODEL, generateTokensIn, generateTokensOut);
+  record.estimatedCostUsd =
+    estimateCost(GENERATE_MODEL, generateTokensIn, generateTokensOut) +
+    estimateCost("claude-haiku-4-5", crawlResult.captionTokensIn, crawlResult.captionTokensOut) +
+    estimateCost(GENERATE_MODEL, scorerTokensIn, scorerTokensOut);
 
   let baselineSavedPath: string | null = null;
 
@@ -603,19 +830,18 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
   if (savedPath) {
     console.log("\n[fidelity] Computing final fidelity metrics...");
     try {
-      const fidelity = await collectFidelityMetrics(
+      const { metrics: fidelity, tokensIn: fidelityIn, tokensOut: fidelityOut } = await collectFidelityMetrics(
         { screenshotBase64: crawlResult.screenshotBase64, sectionScreenshots: crawlResult.sourceSectionScreenshots },
         archDoc,
         savedPath,
         baselineSavedPath ?? undefined,
       );
+      scorerTokensIn += fidelityIn;
+      scorerTokensOut += fidelityOut;
       record.fidelityMetrics = fidelity;
       if (record.baseline) {
         record.baseline.mainScore = fidelity.mainVlmScore.score;
         record.baseline.mainThumbnail = fidelity.mainScreenshotBase64;
-        if (fidelity.baselineVlmScore) {
-          record.baseline.baselineScore = fidelity.baselineVlmScore.score;
-        }
         if (fidelity.baselineScreenshotBase64) {
           record.baseline.baselineThumbnail = fidelity.baselineScreenshotBase64;
         }

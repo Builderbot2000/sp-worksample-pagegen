@@ -33,8 +33,10 @@ import {
   formatArchDoc,
   assembleSkeleton,
   generateSection,
+  extractShellTag,
+  assembleNeighbour,
 } from "../src/agent";
-import { screenshotSectionsBySlug } from "../src/observability/fidelity";
+import { screenshotSectionsBySlug, computeSectionDiscrepancies } from "../src/observability/fidelity";
 import { estimateMaxTokens } from "../src/observability/metrics";
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
@@ -48,6 +50,7 @@ const outIndex = args.indexOf("--out");
 const outArg = outIndex !== -1 ? args[outIndex + 1] : undefined;
 const nameIndex = args.indexOf("--name");
 const nameArg = nameIndex !== -1 ? args[nameIndex + 1] : undefined;
+const correctionArg = args.includes("--correction");
 
 if (!urlArg) {
   console.error("Usage: npx tsx scripts/test-generate.ts <url> [--name <label>] [--out <dir>]");
@@ -72,12 +75,19 @@ async function main() {
   fs.mkdirSync(mainDir, { recursive: true });
   fs.mkdirSync(sectionsDir, { recursive: true });
 
+  const runStartedAt = Date.now();
+  let crawlDurationMs = 0;
+  let skeletonDurationMs = 0;
+  let sectionsDurationMs = 0;
+
   console.log(`\n[generate] Crawling: ${urlArg}`);
   console.log(`[generate] Output:   ${outDir}\n`);
 
   // ── Crawl ─────────────────────────────────────────────────────────────────
 
+  const crawlStart = Date.now();
   const crawlResult = await crawlAndPreprocess(urlArg!);
+  crawlDurationMs = Date.now() - crawlStart;
 
   fs.writeFileSync(path.join(outDir, "screenshot.png"), Buffer.from(crawlResult.screenshotBase64, "base64"));
   console.log(`[generate] Full-page screenshot saved.`);
@@ -121,6 +131,7 @@ async function main() {
   // ── Stage 1: Skeleton ─────────────────────────────────────────────────────
 
   console.log(`\n[generate] Stage 1 — skeleton (${GENERATE_MODEL})...`);
+  const skeletonStart = Date.now();
   let skeletonHtml: string | null = null;
   let skeletonBasename: string | null = null;
 
@@ -229,12 +240,28 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
   });
 
   ({ tokensIn: skeletonTokensIn, tokensOut: skeletonTokensOut } = await renderStream(skeletonRunner));
+  skeletonDurationMs = Date.now() - skeletonStart;
   console.log(`[generate] Skeleton done — ${skeletonTokensIn} in / ${skeletonTokensOut} out tokens`);
 
   // ── Stage 2: Section Agents (parallel) ────────────────────────────────────
 
-  const sectionResults: { slug: string; fragment: string; tokensIn: number; tokensOut: number }[] = [];
+  interface IterLog {
+    iter: number;
+    aggregateScore: number;
+    matched: number;
+    unmatched: number;
+    sections: { slug: string; score: number; severity: string; issues: string[]; fixed: boolean }[];
+    slugsFixed: string[];
+    tokensIn: number;
+    tokensOut: number;
+    durationMs: number;
+    reportFile: string;
+  }
+  const iterLogs: IterLog[] = [];
+  const correctionsDir = path.join(outDir, "corrections");
 
+  const sectionResults: { slug: string; fragment: string; tokensIn: number; tokensOut: number }[] = [];
+  const sectionsStart = Date.now();
   if (skeletonHtml) {
     console.log(`\n[generate] Stage 2 — ${archDoc.sections.length} section agents (parallel)...`);
     const results = await Promise.all(
@@ -256,6 +283,7 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
       sectionTokensOut += r.tokensOut;
     }
     console.log(`[generate] Sections done — ${sectionTokensIn} in / ${sectionTokensOut} out tokens`);
+    sectionsDurationMs = Date.now() - sectionsStart;
 
     // ── Stage 3: Assembly ────────────────────────────────────────────────────
 
@@ -265,6 +293,219 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
     const assembledPath = path.join(mainDir, assembledFilename);
     fs.writeFileSync(assembledPath, assembledHtml, "utf-8");
     console.log(`[generate] Assembled — ${assembledPath}`);
+
+    // ── Stage 2.5: Per-section correction loop (--correction) ────────────────
+
+    if (correctionArg) {
+      fs.mkdirSync(correctionsDir, { recursive: true });
+      const CORRECTION_THRESHOLD = 0.85;
+      const PLATEAU_DELTA = 0.01;
+      const MAX_ITER = 2;
+      const fragmentMap = new Map(sectionResults.map((r) => [r.slug, r.fragment]));
+      let prevScore = 0;
+
+      for (let iter = 1; iter <= MAX_ITER; iter++) {
+        const iterStart = Date.now();
+
+        // Screenshot current state before corrections
+        const genScreenshots = await screenshotSectionsBySlug({ file: assembledPath }, archDoc);
+
+        // Save per-iter screenshots
+        const iterScreenshotsDir = path.join(correctionsDir, `iter-${iter}`);
+        fs.mkdirSync(iterScreenshotsDir, { recursive: true });
+        for (const [slug, bufs] of Object.entries(genScreenshots)) {
+          if (bufs[0]) fs.writeFileSync(path.join(iterScreenshotsDir, `generated-${slug}.png`), bufs[0]);
+        }
+
+        // Score
+        const result = await computeSectionDiscrepancies(
+          crawlResult.sourceSectionScreenshots,
+          genScreenshots,
+          archDoc,
+        );
+        const sectionsToFix = result.discrepancies.filter((d) => (d.score ?? 0) < CORRECTION_THRESHOLD);
+        const slugsToFix = new Set(sectionsToFix.map((d) => d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim()));
+
+        console.log(
+          `[correct] iter ${iter}/${MAX_ITER} — score ${result.aggregateScore.toFixed(2)}, ` +
+          `fixing ${sectionsToFix.length} sections: [${[...slugsToFix].join(", ")}]`,
+        );
+
+        // Write per-iteration report
+        const iterReportFile = `corrections/iter-${iter}-report.html`;
+        const iterSectionCards = archDoc.sections.map((s) => {
+          const disc = result.discrepancies.find((d) => {
+            const base = d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim();
+            return base === s.slug;
+          });
+          const score = disc?.score ?? 1;
+          const severity = score >= 0.85 ? "low" : score >= 0.6 ? "medium" : "high";
+          const isFixed = slugsToFix.has(s.slug);
+          const scoreColor = score >= 0.85 ? "#34d399" : score >= 0.6 ? "#fbbf24" : "#f87171";
+          const sourceImg = path.relative(outDir, path.join(sectionsDir, `source-${s.slug}.png`));
+          const genImg = path.relative(outDir, path.join(iterScreenshotsDir, `generated-${s.slug}.png`));
+          const hasSource = fs.existsSync(path.join(sectionsDir, `source-${s.slug}.png`));
+          const hasGen = fs.existsSync(path.join(iterScreenshotsDir, `generated-${s.slug}.png`));
+          return `<div class="section-card${isFixed ? " fixing" : ""}">
+  <div class="section-header">
+    <span class="section-slug">${escHtml(s.slug)}</span>
+    <span class="section-role">${escHtml(s.role)}</span>
+    <span class="score-badge" style="background:${scoreColor}20;color:${scoreColor};border:1px solid ${scoreColor}40">${(score * 100).toFixed(0)}% ${escHtml(severity)}</span>
+    ${isFixed ? `<span class="badge fixing-badge">FIXING</span>` : ""}
+  </div>
+  ${disc?.issues?.length ? `<ul class="issues-list">${disc.issues.map((i) => `<li>${escHtml(i)}</li>`).join("")}</ul>` : ""}
+  <div class="section-screenshots">
+    <div class="screenshot-col">
+      <div class="screenshot-label">Source</div>
+      ${hasSource ? `<img src="${escHtml(sourceImg)}" />` : `<div class="screenshot-missing">No source</div>`}
+    </div>
+    <div class="screenshot-col">
+      <div class="screenshot-label">Generated (iter ${iter})</div>
+      ${hasGen ? `<img src="${escHtml(genImg)}" />` : `<div class="screenshot-missing">No screenshot</div>`}
+    </div>
+  </div>
+</div>`;
+        }).join("\n");
+
+        const iterReportHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Correction iter ${iter} — ${escHtml(urlArg!)}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #e5e7eb; padding: 2rem; line-height: 1.5; }
+    h1 { font-size: 1.1rem; font-weight: 700; color: #f9fafb; margin-bottom: 0.25rem; }
+    h2 { font-size: 0.85rem; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 1rem; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+    .score-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.7rem; font-weight: 700; }
+    .fixing-badge { background: #78350f; color: #fbbf24; }
+    .section-card { background: #1f2937; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }
+    .section-card.fixing { border-left: 3px solid #fbbf24; }
+    .section-header { display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+    .section-slug { font-family: monospace; font-size: 0.9rem; color: #60a5fa; font-weight: 600; }
+    .section-role { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; background: #374151; color: #d1d5db; padding: 0.15rem 0.5rem; border-radius: 3px; }
+    .issues-list { font-size: 0.8rem; color: #fca5a5; margin: 0.5rem 0 0.75rem 1rem; }
+    .issues-list li + li { margin-top: 0.25rem; }
+    .section-screenshots { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 0.75rem; }
+    .screenshot-col { display: flex; flex-direction: column; gap: 0.5rem; }
+    .screenshot-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; }
+    .screenshot-col img { width: 100%; border-radius: 4px; border: 1px solid #374151; display: block; }
+    .screenshot-missing { font-size: 0.8rem; color: #6b7280; padding: 1rem; background: #111827; border-radius: 4px; text-align: center; }
+    .stat { display: inline-block; margin-right: 1.5rem; font-size: 0.85rem; color: #d1d5db; }
+    .stat span { font-weight: 700; color: #f9fafb; }
+  </style>
+</head>
+<body>
+  <h1>Correction Iteration ${iter}/${MAX_ITER}</h1>
+  <p style="color:#9ca3af;font-size:0.85rem;margin-top:0.25rem;margin-bottom:1.25rem">${escHtml(urlArg!)}</p>
+  <div style="margin-bottom:1.5rem">
+    <span class="stat">Aggregate score <span>${(result.aggregateScore * 100).toFixed(1)}%</span></span>
+    <span class="stat">Matched <span>${result.matched}</span></span>
+    <span class="stat">Unmatched <span>${result.unmatched}</span></span>
+    <span class="stat">Fixing <span>${sectionsToFix.length}</span></span>
+  </div>
+  ${iterSectionCards}
+</body>
+</html>`;
+        fs.writeFileSync(path.join(outDir, iterReportFile), iterReportHtml);
+        console.log(`[correct] iter ${iter} report saved: ${iterReportFile}`);
+
+        // Record for run.json (no base64)
+        const iterTokensInBefore = sectionTokensIn;
+        const iterTokensOutBefore = sectionTokensOut;
+
+        if (sectionsToFix.length === 0) {
+          iterLogs.push({
+            iter, aggregateScore: result.aggregateScore,
+            matched: result.matched, unmatched: result.unmatched,
+            sections: archDoc.sections.map((s) => {
+              const disc = result.discrepancies.find((d) => d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim() === s.slug);
+              return { slug: s.slug, score: disc?.score ?? 1, severity: disc?.severity ?? "low", issues: disc?.issues ?? [], fixed: false };
+            }),
+            slugsFixed: [], tokensIn: 0, tokensOut: 0,
+            durationMs: Date.now() - iterStart, reportFile: iterReportFile,
+          });
+          break;
+        }
+        if (iter > 1 && result.aggregateScore - prevScore < PLATEAU_DELTA) {
+          iterLogs.push({
+            iter, aggregateScore: result.aggregateScore,
+            matched: result.matched, unmatched: result.unmatched,
+            sections: archDoc.sections.map((s) => {
+              const disc = result.discrepancies.find((d) => d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim() === s.slug);
+              return { slug: s.slug, score: disc?.score ?? 1, severity: disc?.severity ?? "low", issues: disc?.issues ?? [], fixed: false };
+            }),
+            slugsFixed: [], tokensIn: 0, tokensOut: 0,
+            durationMs: Date.now() - iterStart, reportFile: iterReportFile,
+          });
+          console.log(`[correct] Plateau detected — stopping.`);
+          break;
+        }
+        prevScore = result.aggregateScore;
+
+        // Fix sections
+        const correctionResults = await Promise.all(
+          sectionsToFix.map((d) => {
+            const baseSlug = d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim();
+            const section = archDoc.sections.find((s) => s.slug === baseSlug);
+            if (!section) return Promise.resolve({ slug: baseSlug, fragment: "", tokensIn: 0, tokensOut: 0 });
+            const i = archDoc.sections.indexOf(section);
+            const selfTag = extractShellTag(skeletonHtml, section.slug);
+            const prevSlug = archDoc.sections[i - 1]?.slug;
+            const nextSlug = archDoc.sections[i + 1]?.slug;
+            const prevShell = prevSlug ? extractShellTag(skeletonHtml, prevSlug) : undefined;
+            const nextShell = nextSlug ? extractShellTag(skeletonHtml, nextSlug) : undefined;
+            const prevTag = prevShell
+              ? assembleNeighbour(prevShell, fragmentMap.get(prevSlug!) ?? "")
+              : undefined;
+            const nextTag = nextShell
+              ? assembleNeighbour(nextShell, fragmentMap.get(nextSlug!) ?? "")
+              : undefined;
+            const shellCtx = selfTag ? { self: selfTag, prev: prevTag, next: nextTag } : undefined;
+            return generateSection(
+              section,
+              { prev: archDoc.sections[i - 1]?.slug, next: archDoc.sections[i + 1]?.slug },
+              crawlResult.sourceSectionScreenshots[section.slug] ?? [],
+              crawlResult.computedStyles,
+              crawlResult.fontFamilies,
+              crawlResult.imageUrls,
+              urlArg!,
+              undefined,
+              shellCtx,
+              d.issues,
+              genScreenshots[section.slug]?.[0],
+              fragmentMap.get(baseSlug),
+            );
+          }),
+        );
+
+        for (const r of correctionResults) {
+          fragmentMap.set(r.slug, r.fragment);
+          sectionTokensIn += r.tokensIn;
+          sectionTokensOut += r.tokensOut;
+        }
+        const reassembled = assembleSkeleton(
+          skeletonHtml,
+          [...fragmentMap].map(([slug, fragment]) => ({ slug, fragment })),
+        );
+        fs.writeFileSync(assembledPath, reassembled, "utf-8");
+
+        iterLogs.push({
+          iter, aggregateScore: result.aggregateScore,
+          matched: result.matched, unmatched: result.unmatched,
+          sections: archDoc.sections.map((s) => {
+            const disc = result.discrepancies.find((d) => d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim() === s.slug);
+            return { slug: s.slug, score: disc?.score ?? 1, severity: disc?.severity ?? "low", issues: disc?.issues ?? [], fixed: slugsToFix.has(s.slug) };
+          }),
+          slugsFixed: [...slugsToFix],
+          tokensIn: sectionTokensIn - iterTokensInBefore,
+          tokensOut: sectionTokensOut - iterTokensOutBefore,
+          durationMs: Date.now() - iterStart,
+          reportFile: iterReportFile,
+        });
+      }
+    }
 
     // ── Screenshot generated sections ────────────────────────────────────────
 
@@ -402,6 +643,47 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
 
   fs.writeFileSync(path.join(outDir, "report.html"), reportHtml);
   console.log(`[generate] report.html saved.`);
+
+  // ── run.json ──────────────────────────────────────────────────────────────
+
+  const runJson = {
+    url: urlArg!,
+    name: nameArg ?? null,
+    startedAt: runStartedAt,
+    completedAt: Date.now(),
+    durationMs: Date.now() - runStartedAt,
+    model: GENERATE_MODEL,
+    correction: correctionArg,
+    stages: {
+      crawl: {
+        durationMs: crawlDurationMs,
+        sectionCount: crawlResult.visualArchDoc.sections.length,
+        htmlBytes: crawlResult.html.length,
+        truncated: crawlResult.truncated,
+      },
+      skeleton: {
+        tokensIn: skeletonTokensIn,
+        tokensOut: skeletonTokensOut,
+        durationMs: skeletonDurationMs,
+      },
+      sections: {
+        count: crawlResult.visualArchDoc.sections.length,
+        tokensIn: skeletonHtml ? sectionTokensIn - iterLogs.reduce((s, l) => s + l.tokensIn, 0) : sectionTokensIn,
+        tokensOut: skeletonHtml ? sectionTokensOut - iterLogs.reduce((s, l) => s + l.tokensOut, 0) : sectionTokensOut,
+        durationMs: sectionsDurationMs,
+      },
+    },
+    ...(correctionArg ? { iterations: iterLogs } : {}),
+    totals: {
+      tokensIn: totalTokensIn,
+      tokensOut: totalTokensOut,
+      durationMs: Date.now() - runStartedAt,
+    },
+    outputFile: assembledRelPath ?? null,
+  };
+  fs.writeFileSync(path.join(outDir, "run.json"), JSON.stringify(runJson, null, 2));
+  console.log(`[generate] run.json saved.`);
+
   console.log(`\n[generate] Open: ${path.join(outDir, "report.html")}\n`);
 }
 

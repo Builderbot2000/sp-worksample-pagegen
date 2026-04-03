@@ -29,24 +29,22 @@ All flags:
 npm run generate -- <url> \
   --name <label>        # human-readable name for the run (used in report title and output directory)
   --fidelity <mode>     # quality/budget mode: minimal | fast | balanced | high | maximal (default: balanced)
-  --threshold <n>       # convergence score delta threshold (default: 0.02)
   --baseline            # also run the baseline agent and produce a side-by-side comparison report
+  --correction          # run per-section correction loop after initial generation
   --open                # open the generated file in the default browser
 ```
 
 ### Fidelity modes
 
-The `--fidelity` flag controls the number of fix iterations, token budgets at each stage, and whether wide-viewport screenshots are captured. The iteration count also scales with the size of the source page — larger sites (more headings) get more iterations, up to the mode's ceiling.
+The `--fidelity` flag controls the token budget for the skeleton agent and the maximum number of correction iterations per section (when `--correction` is enabled).
 
-| Mode | Iterations | Struct batch | Wide viewport | Relative cost |
-|---|---|---|---|---|
-| `minimal` | 0 | — | No | ~$0.05 |
-| `fast` | 2–3 | 10 | No | ~$0.20 |
-| `balanced` | 3–6 | 15 | Yes | ~$0.50–1.50 |
-| `high` | 4–8 | 20 | Yes | ~$1.50–4.00 |
-| `maximal` | 6–12 | 30 | Yes | ~$4.00+ |
-
-If the source page is too large for the chosen mode to cover fully, a warning is printed at the start of the run suggesting a higher mode.
+| Mode | Max section correction iters | Initial token budget | Relative cost |
+|---|---|---|---|
+| `minimal` | 0 | 8 000 tokens | ~$0.05 |
+| `fast` | 1 | 12 000 tokens | ~$0.20 |
+| `balanced` | 2 | dynamic | ~$0.50–1.50 |
+| `high` | 3 | dynamic | ~$1.50–4.00 |
+| `maximal` | 4 | dynamic | ~$4.00+ |
 
 Output goes to `output/<timestamp>-<name|url-slug>/` and includes `run.ndjson`, `run.json`, `report.html`, and `main/<page>.html`.
 
@@ -109,12 +107,13 @@ npm run test:skeleton -- https://stripe.com/payments --name stripe-skeleton-test
 
 ### Generate test
 
-Runs the crawl + full initial generation (skeleton → parallel section agents → assembly) in isolation (no fidelity loop, no patching). Useful for iterating on the generation prompts without waiting for the full pipeline.
+Runs the crawl + full initial generation (skeleton → parallel section agents → assembly) in isolation (no fidelity loop, no patching). Useful for iterating on the generation prompts without waiting for the full pipeline. Pass `--correction` to also run the per-section correction loop after assembly.
 
 ```sh
 npm run test:generate -- <url>
 npm run test:generate -- <url> --name <label>
 npm run test:generate -- <url> --name <label> --out <dir>
+npm run test:generate -- <url> --name <label> --correction
 ```
 
 Output goes to `output/<timestamp>-<name|generate-test>/` and includes `main/<page>.html`, `screenshot.png`, `arch.json`, and `report.html`.
