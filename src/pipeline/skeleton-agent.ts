@@ -10,8 +10,9 @@ import { SKELETON_SYSTEM, buildSkeletonUserContent } from "../prompts/skeleton";
 import { formatArchDoc } from "./assembly";
 import type { CrawlResult } from "../context";
 import type { FidelityBudget } from "../observability/types";
+import { MODELS } from "../config";
 
-const GENERATE_MODEL = "claude-sonnet-4-6";
+const GENERATE_MODEL = MODELS.skeleton;
 
 const client = new Anthropic();
 

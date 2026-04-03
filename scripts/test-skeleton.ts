@@ -48,7 +48,9 @@ if (!urlArg) {
   process.exit(1);
 }
 
-const SKELETON_MODEL = "claude-sonnet-4-6";
+import { MODELS } from "../src/config";
+
+const SKELETON_MODEL = MODELS.skeleton;
 const client = new Anthropic();
 
 async function main() {

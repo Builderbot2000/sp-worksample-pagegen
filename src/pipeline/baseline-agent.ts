@@ -6,8 +6,9 @@ import * as path from "path";
 import { renderStream } from "../render";
 import { estimateMaxTokens } from "../observability/metrics";
 import { BASELINE_SYSTEM, buildBaselineUserContent } from "../prompts/baseline";
+import { MODELS } from "../config";
 
-const BASELINE_MODEL = "claude-haiku-4-5";
+const BASELINE_MODEL = MODELS.baseline;
 
 const client = new Anthropic();
 

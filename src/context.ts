@@ -1,6 +1,7 @@
 import puppeteer from "puppeteer";
 import Anthropic from "@anthropic-ai/sdk";
 import { resizeForVlm } from "./image";
+import { MODELS } from "./config";
 import type { VisualArchDoc, SectionSpec } from "./observability/types";
 
 const VIEWPORT = { width: 1280, height: 900 };
@@ -10,8 +11,8 @@ const MAX_SCREENSHOT_HEIGHT = 7800;
 const SECTION_TALL_THRESHOLD = 1350;
 // Hard cap on detected sections
 const MAX_SECTIONS = 20;
-// Haiku model used for cheap section captioning
-const CAPTION_MODEL = "claude-haiku-4-5";
+
+const CAPTION_MODEL = MODELS.caption;
 
 const captionClient = new Anthropic();
 

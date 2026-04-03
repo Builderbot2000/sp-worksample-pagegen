@@ -2,6 +2,7 @@ import puppeteer from "puppeteer";
 import Anthropic from "@anthropic-ai/sdk";
 import * as path from "path";
 import { resizeForVlm } from "../image";
+import { MODELS } from "../config";
 import type {
   VlmFidelityScore,
   VlmVerdict,
@@ -14,7 +15,7 @@ import type {
 const VIEWPORT = { width: 1280, height: 900 };
 const MAX_SCREENSHOT_HEIGHT = 7800;
 // Section pairs per VLM call — keep small to avoid context limit blowups on long pages
-const VLM_BATCH_SIZE = 5;
+const VLM_BATCH_SIZE = 8;
 
 const client = new Anthropic();
 
@@ -172,7 +173,7 @@ export async function computeSectionDiscrepancies(
 
         try {
           const response = await client.messages.create({
-            model: "claude-sonnet-4-6",
+            model: MODELS.vlmScorer,
             max_tokens: opts?.maxTokens ?? 512 + 256 * batch.length,
             temperature: 0,
             system: SECTION_VLM_SYSTEM,

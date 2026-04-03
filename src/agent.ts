@@ -16,9 +16,10 @@ import { generateSection } from "./pipeline/section-agent";
 export { generateSection };
 import { runBaseline } from "./pipeline/baseline-agent";
 import { runCorrectionLoop } from "./pipeline/correction-loop";
+import { MODELS } from "./config";
 
-const BASELINE_MODEL = "claude-haiku-4-5";
-export const GENERATE_MODEL = "claude-sonnet-4-6";
+export const GENERATE_MODEL = MODELS.sectionInitial;
+const BASELINE_MODEL = MODELS.baseline;
 
 // ─── Fidelity budget ──────────────────────────────────────────────────────────────────────────────
 
@@ -189,7 +190,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
   record.completedAt = Date.now();
   record.estimatedCostUsd =
     estimateCost(GENERATE_MODEL, generateTokensIn, generateTokensOut) +
-    estimateCost("claude-haiku-4-5", crawlResult.captionTokensIn, crawlResult.captionTokensOut) +
+    estimateCost(MODELS.caption, crawlResult.captionTokensIn, crawlResult.captionTokensOut) +
     estimateCost(GENERATE_MODEL, scorerTokensIn, scorerTokensOut);
 
   let baselineSavedPath: string | null = null;

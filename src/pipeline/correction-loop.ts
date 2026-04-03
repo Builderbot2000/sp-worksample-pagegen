@@ -7,8 +7,9 @@ import { buildCorrectionIterReport } from "../observability/correction-report";
 import type { CrawlResult } from "../context";
 import type { VisualArchDoc, IterationRecord } from "../observability/types";
 import type { FidelityBudget } from "../observability/types";
+import { MODELS } from "../config";
 
-const CORRECTION_THRESHOLD = 0.85;
+const CORRECTION_THRESHOLD = 0.70;
 const PLATEAU_DELTA = 0.01;
 
 export interface CorrectionLoopParams {
@@ -45,6 +46,10 @@ export async function runCorrectionLoop(
   let sectionTokensOut = 0;
   const iterationRecords: IterationRecord[] = [];
 
+  // Sections that have already scored ≥ CORRECTION_THRESHOLD — skip VLM scoring and
+  // re-generation for them in subsequent iterations.
+  const settledSlugs = new Set<string>();
+
   const correctionsDir = path.join(runDir, "corrections");
   const sectionsDir = path.join(runDir, "sections");
 
@@ -58,6 +63,19 @@ export async function runCorrectionLoop(
   for (let iter = 1; iter <= budget.maxSectionIter; iter++) {
     const genScreenshots = await screenshotSectionsBySlug({ file: assembledPath }, archDoc);
 
+    // Build filtered views that exclude sections already settled in a prior iteration.
+    // We still screenshot all sections above (needed for the HTML report and final output),
+    // but we skip settled ones in VLM scoring and re-generation.
+    const activeArchDoc = settledSlugs.size > 0
+      ? { ...archDoc, sections: archDoc.sections.filter((s) => !settledSlugs.has(s.slug)) }
+      : archDoc;
+    const activeSource = settledSlugs.size > 0
+      ? Object.fromEntries(Object.entries(crawlResult.sourceSectionScreenshots).filter(([k]) => !settledSlugs.has(k)))
+      : crawlResult.sourceSectionScreenshots;
+    const activeGen = settledSlugs.size > 0
+      ? Object.fromEntries(Object.entries(genScreenshots).filter(([k]) => !settledSlugs.has(k)))
+      : genScreenshots;
+
     const iterScreenshotsDir = path.join(correctionsDir, `iter-${iter}`);
     fs.mkdirSync(iterScreenshotsDir, { recursive: true });
     for (const [slug, bufs] of Object.entries(genScreenshots)) {
@@ -65,15 +83,25 @@ export async function runCorrectionLoop(
     }
 
     const result = await computeSectionDiscrepancies(
-      crawlResult.sourceSectionScreenshots,
-      genScreenshots,
-      archDoc,
+      activeSource,
+      activeGen,
+      activeArchDoc,
     );
     scorerTokensIn += result.tokensIn;
     scorerTokensOut += result.tokensOut;
 
     const sectionsToFix = result.discrepancies.filter((d) => (d.score ?? 0) < CORRECTION_THRESHOLD);
     const slugsToFix = new Set(sectionsToFix.map((d) => d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim()));
+
+    // Sections that were VLM-scored this iteration but don’t need fixing have ≥ threshold — settle them.
+    for (const slug of activeArchDoc.sections.map((s) => s.slug)) {
+      if (activeGen[slug] && !slugsToFix.has(slug)) {
+        if (!settledSlugs.has(slug)) {
+          settledSlugs.add(slug);
+          console.log(`[correct] section "${slug}" settled — skipping in future iterations`);
+        }
+      }
+    }
 
     console.log(
       `[correct] iter ${iter}/${budget.maxSectionIter} — score ${result.aggregateScore.toFixed(2)}, ` +
@@ -144,8 +172,9 @@ export async function runCorrectionLoop(
           rootCssVars || undefined,
           shellCtx,
           d.issues,
-          genScreenshots[section.slug]?.[0],
+          undefined,
           fragmentMap.get(baseSlug),
+          MODELS.sectionCorrection,
         );
       }),
     );

@@ -33,8 +33,10 @@ import type { VisualArchDoc, SectionDiscrepancy } from "../src/observability/typ
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const GENERATE_MODEL = "claude-sonnet-4-6";
-const FIX_MODEL = "claude-sonnet-4-6";
+import { MODELS } from "../src/config";
+
+const GENERATE_MODEL = MODELS.sectionInitial;
+const FIX_MODEL = MODELS.sectionCorrection;
 const client = new Anthropic();
 
 // ── Args ──────────────────────────────────────────────────────────────────────

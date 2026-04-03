@@ -3,8 +3,7 @@ import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 import { renderStream } from "../render";
 import { SECTION_SYSTEM, buildSectionUserContent } from "../prompts/section";
-
-const GENERATE_MODEL = "claude-sonnet-4-6";
+import { MODELS } from "../config";
 const SECTION_MAX_TOKENS = 8_000;
 
 const client = new Anthropic();
@@ -22,6 +21,7 @@ export async function generateSection(
   corrections?: string[],
   currentScreenshot?: Buffer,
   currentHtml?: string,
+  model?: string,
 ): Promise<{ slug: string; fragment: string; tokensIn: number; tokensOut: number }> {
   let fragment: string | null = null;
 
@@ -57,7 +57,7 @@ export async function generateSection(
   });
 
   const sectionRunner = client.beta.messages.toolRunner({
-    model: GENERATE_MODEL,
+    model: model ?? MODELS.sectionInitial,
     max_tokens: SECTION_MAX_TOKENS,
     thinking: { type: "disabled" },
     tools: [saveSectionTool],
