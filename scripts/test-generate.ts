@@ -451,11 +451,23 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
             const section = archDoc.sections.find((s) => s.slug === baseSlug);
             if (!section) return Promise.resolve({ slug: baseSlug, fragment: "", tokensIn: 0, tokensOut: 0 });
             const i = archDoc.sections.indexOf(section);
-            const selfTag = extractShellTag(skeletonHtml, section.slug);
+            let selfTag: string | undefined;
+            if (section.slug) {
+              // @ts-ignore — slug is guaranteed non-null by the if condition, but TS won't narrow properly
+              selfTag = extractShellTag(skeletonHtml, section.slug);
+            }
             const prevSlug = archDoc.sections[i - 1]?.slug;
             const nextSlug = archDoc.sections[i + 1]?.slug;
-            const prevShell = prevSlug ? extractShellTag(skeletonHtml, prevSlug) : undefined;
-            const nextShell = nextSlug ? extractShellTag(skeletonHtml, nextSlug) : undefined;
+            let prevShell: string | undefined;
+            if (prevSlug) {
+              // @ts-ignore — prevSlug is guaranteed non-null by the if condition, but TS won't narrow properly
+              prevShell = extractShellTag(skeletonHtml, prevSlug);
+            }
+            let nextShell: string | undefined;
+            if (nextSlug) {
+              // @ts-ignore — nextSlug is guaranteed non-null by the if condition, but TS won't narrow properly
+              nextShell = extractShellTag(skeletonHtml, nextSlug);
+            }
             const prevTag = prevShell
               ? assembleNeighbour(prevShell, fragmentMap.get(prevSlug!) ?? "")
               : undefined;

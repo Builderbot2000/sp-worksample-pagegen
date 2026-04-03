@@ -10,5 +10,4 @@
 
 6. A whole new workflow replaced the VLM scoring loops with discrepancy checks
 
-7. 
 
