@@ -254,7 +254,7 @@ Generate the fragment now using the save_section tool.`,
     tools: [saveSectionTool],
     tool_choice: { type: "tool", name: "save_section" },
     stream: true,
-    max_iterations: 1,
+    max_iterations: 2,
     system: `You are an expert front-end developer generating interior content for a single section of a webpage.
 
 You are Stage 2 of a parallel section generation pipeline:

@@ -38,27 +38,38 @@ export async function screenshotSectionsBySlug(
 
     const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
 
-    const sectionRects = await page.evaluate(() => {
-      const results: Array<{ slug: string; y: number; height: number }> = [];
-      const els = document.querySelectorAll("[data-section-slug]");
-      for (const el of els) {
-        const slug = el.getAttribute("data-section-slug") ?? "";
-        if (!slug) continue;
-        const rect = el.getBoundingClientRect();
-        results.push({ slug, y: rect.top + window.scrollY, height: rect.height });
-      }
-      return results;
-    });
+    // A section must render to at least this fraction of its source height to be
+    // considered renderable. Anything shorter is a collapsed/empty shell and gets
+    // excluded so the scorer doesn't waste tokens on a thin strip.
+    const MIN_HEIGHT_RATIO = 0.25;
 
     const result: Record<string, Buffer[]> = {};
-    for (const { slug, y, height } of sectionRects) {
-      const clipY = Math.max(0, y);
-      const clipHeight = Math.min(height, MAX_SCREENSHOT_HEIGHT, scrollHeight - clipY);
+    for (const spec of archDoc.sections) {
+      const el = await page.$(`[data-section-slug="${spec.slug}"]`);
+      if (!el) continue;
+      const box = await el.boundingBox();
+
+      if (!box || box.height < 4) {
+        console.warn(`[fidelity] Skipping "${spec.slug}" — rendered height ${box?.height ?? 0}px (empty shell)`);
+        continue;
+      }
+
+      const minRequired = spec.heightPx > 0 ? spec.heightPx * MIN_HEIGHT_RATIO : 4;
+      if (box.height < minRequired) {
+        console.warn(
+          `[fidelity] Skipping "${spec.slug}" — rendered ${Math.round(box.height)}px vs expected ~${spec.heightPx}px ` +
+          `(${Math.round((box.height / spec.heightPx) * 100)}% of source height, threshold ${Math.round(MIN_HEIGHT_RATIO * 100)}%)`,
+        );
+        continue;
+      }
+
+      const clipY = Math.max(0, box.y);
+      const clipHeight = Math.min(box.height, MAX_SCREENSHOT_HEIGHT, scrollHeight - clipY);
       const buf = await page.screenshot({
         type: "png",
-        clip: { x: 0, y: clipY, width: VIEWPORT.width, height: Math.max(1, clipHeight) },
+        clip: { x: 0, y: clipY, width: VIEWPORT.width, height: Math.max(4, clipHeight) },
       });
-      result[slug] = [Buffer.from(buf)];
+      result[spec.slug] = [Buffer.from(buf)];
     }
     return result;
   } finally {
