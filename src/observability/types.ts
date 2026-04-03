@@ -6,6 +6,13 @@ export type Severity = "high" | "medium" | "low";
 
 export type FidelityMode = "minimal" | "fast" | "balanced" | "high" | "maximal";
 
+export interface FidelityBudget {
+  /** Hard cap for initial generation. null = use estimateMaxTokens() dynamically. */
+  generateMaxTokens: number | null;
+  /** Max correction iterations per section. 0 = no correction loop. */
+  maxSectionIter: number;
+}
+
 // ─── Visual architecture ──────────────────────────────────────────────────────
 
 export interface SectionSpec {

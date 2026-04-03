@@ -24,11 +24,13 @@ import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
-import sharp from "sharp";
 import { crawlAndPreprocess } from "../src/context";
 import { renderStream } from "../src/render";
+import { resizeForVlm } from "../src/image";
 import { estimateMaxTokens } from "../src/observability/metrics";
-import type { VisualArchDoc } from "../src/observability/types";
+import { escHtml, slugify } from "../src/utils";
+import { formatArchDoc } from "../src/pipeline/assembly";
+import { SKELETON_SYSTEM, buildSkeletonUserContent } from "../src/prompts/skeleton";
 
 // ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -48,38 +50,6 @@ if (!urlArg) {
 
 const SKELETON_MODEL = "claude-sonnet-4-6";
 const client = new Anthropic();
-
-function slugify(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function formatArchDoc(archDoc: VisualArchDoc): string {
-  const sectionsText = archDoc.sections
-    .map(
-      (s) =>
-        `  ${s.order}. slug: "${s.slug}" | role: ${s.role}\n     ${s.description}`,
-    )
-    .join("\n");
-  const fixedText =
-    archDoc.fixedElements.length > 0
-      ? archDoc.fixedElements.join("; ")
-      : "None";
-  return `Background: ${archDoc.backgroundDescription}
-Fixed/sticky elements: ${fixedText}
-Sections (in visual order):
-${sectionsText}`;
-}
-
-function escHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
 async function main() {
   const runSlug = nameArg ? slugify(nameArg) : "skeleton-test";
@@ -126,40 +96,31 @@ async function main() {
   // ── Resize full-page screenshot for VLM input ─────────────────────────────
 
   const screenshotBuf = Buffer.from(crawlResult.screenshotBase64, "base64");
-  const resizedScreenshot = await sharp(screenshotBuf)
-    .resize({ width: 1024, withoutEnlargement: true })
-    .jpeg({ quality: 80 })
-    .toBuffer();
+  const resizedScreenshot = await resizeForVlm(screenshotBuf);
   console.log(`[skeleton] Screenshot resized for VLM input.`);
 
-  // ── Skeleton generation ───────────────────────────────────────────────────
+  // ── Skeleton generation ───────────────────────────────────────────────────────────────────────────
 
   const archDocText = formatArchDoc(crawlResult.visualArchDoc);
-  const stylesJson = JSON.stringify(crawlResult.computedStyles, null, 2);
-  const fontsText = crawlResult.fontFamilies.join(", ");
-  const imageUrlsText = crawlResult.imageUrls.join("\n");
-  const svgsText = crawlResult.svgs.join("\n");
   const slugList = crawlResult.visualArchDoc.sections
     .map((s) => `  ${s.order}. "${s.slug}" (${s.role})`)
-    .join("\n");
+    .join('\n');
+  const navIsSection = crawlResult.visualArchDoc.sections.some(
+    (s) => s.role === 'navbar' || s.role === 'header',
+  );
 
   let savedPath: string | null = null;
 
   const saveFile = betaZodTool({
-    name: "save_file",
-    description:
-      "Save the generated skeleton HTML to disk. Call this once with the complete skeleton HTML.",
+    name: 'save_file',
+    description: 'Save the generated skeleton HTML to disk. Call this once with the complete skeleton HTML.',
     inputSchema: z.object({
-      filename: z
-        .string()
-        .describe(
-          "A descriptive kebab-case filename, e.g. acme-landing-page-skeleton.html",
-        ),
-      content: z.string().describe("The full skeleton HTML content"),
+      filename: z.string().describe('A descriptive kebab-case filename, e.g. acme-landing-page-skeleton.html'),
+      content: z.string().describe('The full skeleton HTML content'),
     }),
     run: async (input) => {
       const outPath = path.join(mainDir, input.filename);
-      fs.writeFileSync(outPath, input.content, "utf-8");
+      fs.writeFileSync(outPath, input.content, 'utf-8');
       savedPath = outPath;
       return JSON.stringify({ success: true, file_path: outPath });
     },
@@ -171,93 +132,32 @@ async function main() {
   const runner = client.beta.messages.toolRunner({
     model: SKELETON_MODEL,
     max_tokens: estimateMaxTokens(crawlResult.html.length, SKELETON_MODEL),
-    thinking: { type: "disabled" },
+    thinking: { type: 'disabled' },
     tools: [saveFile],
-    tool_choice: { type: "tool", name: "save_file" },
+    tool_choice: { type: 'tool', name: 'save_file' },
     stream: true,
     max_iterations: 1,
-    system: `You are an expert front-end developer building a structural skeleton for a multi-agent page generation pipeline.
-
-Your role is Stage 1 of a two-stage process:
-- Stage 1 (YOU): Produce the structural skeleton — all global elements complete, section interiors intentionally empty.
-- Stage 2 (downstream agents): Fill in each section's interior content independently and in parallel.
-
-SKELETON CONTRACT — strictly enforced:
-
-1. GLOBAL ELEMENTS must be fully rendered:
-   - Complete <head>: charset, viewport, title, font imports, Tailwind CDN script tag
-   - Tailwind config block (<script>tailwind.config = {...}</script>) with theme.extend containing CSS custom properties for brand colours, fonts, and spacing extracted from the source
-   - CSS custom properties in a <style> :root block for any values that cannot be expressed as Tailwind config
-   - Navigation / header element: fully rendered with real content (logo, nav links, CTA buttons)
-   - All fixed/sticky elements listed in <fixed_elements_html>: use their structure and content as reference, but rewrite using Tailwind utility classes — do not copy source-site class names verbatim as they belong to a different CSS system
-   - Page-level layout wrappers (<main>, outer container divs) with correct spacing and background
-
-2. SECTION SHELLS must be empty:
-   - One shell element per section listed in the visual architecture spec
-   - Each shell's outermost element MUST carry exactly:
-       data-section-slug="<slug>"   — verbatim from the spec
-       data-section-order="<N>"     — integer 1-based order from the spec
-   - Shell interior must contain NO content — no headings, paragraphs, images, or buttons
-   - Shell elements must have appropriate semantic tag (section, article, div) and any outer layout classes (e.g. bg-*, py-*) inferred from the source, but nothing inside
-
-3. OUTPUT is a complete, valid, self-contained HTML file using Tailwind CSS via CDN.`,
+    system: SKELETON_SYSTEM(navIsSection),
     messages: [
       {
-        role: "user",
-        content: [
-          {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: "image/jpeg",
-              data: resizedScreenshot.toString("base64"),
-            },
-          },
-          {
-            type: "text",
-            text: `The image above is a screenshot of the source page at ${urlArg}. Use it as a visual reference for global styles, colour palette, typography, and overall layout structure.
-
-Your task is to generate the SKELETON HTML for this page. The skeleton must include all global elements (head, fonts, CSS variables, Tailwind theme config, nav) fully rendered, with one empty shell element for each section listed below. Section shells must be empty — downstream agents will fill in the content.
-
-SECTION SLUGS (one empty shell required for each, in this order):
-${slugList}
-
-<visual_architecture>
-${archDocText}
-</visual_architecture>
-
-<computed_styles>
-${stylesJson}
-</computed_styles>
-
-<fonts>
-${fontsText}
-</fonts>
-
-<image_urls>
-${imageUrlsText}
-</image_urls>
-
-<svgs>
-${svgsText}
-</svgs>
-
-<fixed_elements_html>
-${crawlResult.fixedElementsHtml.join("\n\n")}
-</fixed_elements_html>
-
-<source_html>
-${crawlResult.html}
-</source_html>
-
-Produce the skeleton HTML now. Every section shell must have data-section-slug and data-section-order attributes. Section interiors must be completely empty.`,
-          },
-        ],
+        role: 'user',
+        content: buildSkeletonUserContent({
+          url: urlArg!,
+          resizedScreenshotBase64: resizedScreenshot.toString('base64'),
+          slugList,
+          archDocText,
+          stylesJson: JSON.stringify(crawlResult.computedStyles, null, 2),
+          fontsText: crawlResult.fontFamilies.join(', '),
+          imageUrlsText: crawlResult.imageUrls.join('\n'),
+          svgsText: crawlResult.svgs.join('\n'),
+          fixedElementsHtml: crawlResult.fixedElementsHtml.join('\n\n'),
+          sourceHtml: crawlResult.html,
+        }),
       },
     ],
   });
 
-  const { tokensIn, tokensOut } = await renderStream(runner);
+    const { tokensIn, tokensOut } = await renderStream(runner);
   const durationMs = Date.now() - skeletonStart;
 
   console.log(

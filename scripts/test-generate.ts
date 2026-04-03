@@ -38,6 +38,7 @@ import {
 } from "../src/agent";
 import { screenshotSectionsBySlug, computeSectionDiscrepancies } from "../src/observability/fidelity";
 import { estimateMaxTokens } from "../src/observability/metrics";
+import { escHtml, slugify } from "../src/utils";
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
@@ -58,14 +59,6 @@ if (!urlArg) {
 }
 
 const client = new Anthropic();
-
-function slugify(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-}
-
-function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
 
 async function main() {
   const runSlug = nameArg ? slugify(nameArg) : "generate-test";

@@ -1,17 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
+import { escHtml as escapeHtml } from "../utils";
 import type { RunRecord, IterationRecord, Severity, FidelityMetrics } from "./types";
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;

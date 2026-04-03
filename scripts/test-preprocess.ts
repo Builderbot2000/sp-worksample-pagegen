@@ -16,6 +16,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { crawlAndPreprocess } from "../src/context";
+import { escHtml } from "../src/utils";
 
 // ── Parse args ────────────────────────────────────────────────────────────────
 
@@ -80,10 +81,6 @@ fs.writeFileSync(path.join(outDir, "arch.json"), JSON.stringify(archJson, null, 
 console.log(`[preprocess] arch.json saved.`);
 
 // ── Build HTML report ─────────────────────────────────────────────────────────
-
-function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
 
 function sectionCards(): string {
   return result.visualArchDoc.sections
