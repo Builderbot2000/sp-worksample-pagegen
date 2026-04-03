@@ -1,20 +1,7 @@
 import puppeteer from "puppeteer";
-import { PNG } from "pngjs";
+import Anthropic from "@anthropic-ai/sdk";
+import { resizeForVlm } from "./image";
 import type { VisualArchDoc, SectionSpec } from "./observability/types";
-
-function stitchVertically(buffers: Buffer[]): Buffer {
-  if (buffers.length === 1) return buffers[0];
-  const pngs = buffers.map((b) => PNG.sync.read(b));
-  const width = pngs[0].width;
-  const totalHeight = pngs.reduce((sum, p) => sum + p.height, 0);
-  const out = new PNG({ width, height: totalHeight });
-  let yOffset = 0;
-  for (const p of pngs) {
-    PNG.bitblt(p, out, 0, 0, width, p.height, 0, yOffset);
-    yOffset += p.height;
-  }
-  return PNG.sync.write(out);
-}
 
 const VIEWPORT = { width: 1280, height: 900 };
 const MAX_HTML_CHARS = 80_000;
@@ -23,6 +10,10 @@ const MAX_SCREENSHOT_HEIGHT = 7800;
 const SECTION_TALL_THRESHOLD = 1350;
 // Hard cap on detected sections
 const MAX_SECTIONS = 20;
+// Haiku model used for cheap section captioning
+const CAPTION_MODEL = "claude-haiku-4-5";
+
+const captionClient = new Anthropic();
 
 
 export interface ComputedStyleEntry {
@@ -241,39 +232,62 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
     }, SECTION_TALL_THRESHOLD);
 
     // ── Deduplicate slugs and cap at MAX_SECTIONS ─────────────────────────────
-    const seenSlugs = new Map<string, number>();
-    const dedupedSections = rawSections.slice(0, MAX_SECTIONS).map((s) => {
-      let slug = s.slugCandidate;
-      const count = seenSlugs.get(slug) ?? 0;
-      if (count > 0) slug = `${slug}-${count + 1}`;
-      seenSlugs.set(s.slugCandidate, (seenSlugs.get(s.slugCandidate) ?? 0) + 1);
-      return { ...s, slug };
-    });
+    // Use generic numbered slugs so content-derived names don't anchor section
+    // agents toward partial content (e.g. "iphone" in a multi-product hero).
+    const dedupedSections = rawSections.slice(0, MAX_SECTIONS).map((s, i) => ({
+      ...s,
+      slug: `section-${i + 1}`,
+    }));
 
     // ── Screenshot each section ───────────────────────────────────────────────
     const sourceSectionScreenshots: Record<string, Buffer[]> = {};
     for (const sec of dedupedSections) {
-      const crops: Buffer[] = [];
-      const clipY = Math.max(0, Math.min(sec.y, scrollHeight - VIEWPORT.height));
-      const buf1 = await page.screenshot({
+      const clipY = Math.max(0, sec.y);
+      const clipHeight = Math.min(sec.height, MAX_SCREENSHOT_HEIGHT, scrollHeight - clipY);
+      const buf = await page.screenshot({
         type: "png",
-        clip: { x: 0, y: clipY, width: VIEWPORT.width, height: VIEWPORT.height },
+        clip: { x: 0, y: clipY, width: VIEWPORT.width, height: Math.max(1, clipHeight) },
       });
-      crops.push(Buffer.from(buf1));
-
-      if (sec.height > SECTION_TALL_THRESHOLD) {
-        const clipY2 = Math.max(
-          0,
-          Math.min(sec.y + VIEWPORT.height, scrollHeight - VIEWPORT.height),
-        );
-        const buf2 = await page.screenshot({
-          type: "png",
-          clip: { x: 0, y: clipY2, width: VIEWPORT.width, height: VIEWPORT.height },
-        });
-        crops.push(Buffer.from(buf2));
-      }
-      sourceSectionScreenshots[sec.slug] = [stitchVertically(crops)];
+      sourceSectionScreenshots[sec.slug] = [Buffer.from(buf)];
     }
+
+    // ── VLM caption each section screenshot (parallel, haiku) ─────────────────
+    // Replaces the DOM-derived heading+paragraph heuristic with a full-visual
+    // description that enumerates every distinct content block in the section.
+    console.log(`[preprocess] Captioning ${dedupedSections.length} sections...`);
+    const captionMap = new Map<string, string>();
+    await Promise.all(
+      dedupedSections.map(async (sec) => {
+        const bufs = sourceSectionScreenshots[sec.slug];
+        if (!bufs || bufs.length === 0) return;
+        const resized = await resizeForVlm(bufs[0]);
+        try {
+          const resp = await captionClient.messages.create({
+            model: CAPTION_MODEL,
+            max_tokens: 150,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "image",
+                    source: { type: "base64", media_type: "image/jpeg", data: resized.toString("base64") },
+                  },
+                  {
+                    type: "text",
+                    text: "List each distinct content block visible in this webpage section. One line per block. Be concise.",
+                  },
+                ],
+              },
+            ],
+          });
+          const text = resp.content.find((b) => b.type === "text")?.text?.trim();
+          if (text) captionMap.set(sec.slug, text);
+        } catch {
+          // non-fatal — fall back to DOM description
+        }
+      }),
+    );
 
     // ── Fixed/sticky elements for the arch doc ────────────────────────────────
     const fixedElements = await page.evaluate(() => {
@@ -324,9 +338,10 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
     // ── Build arch doc from DOM data ──────────────────────────────────────────
     const archDocSections: SectionSpec[] = dedupedSections.map((s, i) => ({
       slug: s.slug,
-      description: s.description,
+      description: captionMap.get(s.slug) ?? s.description,
       role: s.role,
       order: i + 1,
+      heightPx: s.height,
     }));
 
     return {

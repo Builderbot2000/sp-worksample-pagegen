@@ -3,56 +3,34 @@ import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
-import sharp from "sharp";
+import { resizeForVlm } from "./image";
 import { renderStream } from "./render";
 import { crawlAndPreprocess } from "./context";
 import { Recorder } from "./observability/recorder";
 import { Logger } from "./observability/logger";
-import { estimateCost, estimateMaxTokens, computeIterBudget } from "./observability/metrics";
-import {
-  collectFidelityMetrics,
-  screenshotSectionsBySlug,
-  computeSectionDiscrepancies,
-  scoreSeverity,
-} from "./observability/fidelity";
+import { estimateCost, estimateMaxTokens } from "./observability/metrics";
+import { collectFidelityMetrics } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
-import type { RunRecord, FidelityMode, IterationRecord, VisualArchDoc } from "./observability/types";
+import type { RunRecord, FidelityMode, VisualArchDoc } from "./observability/types";
 
 const BASELINE_MODEL = "claude-haiku-4-5";
 export const GENERATE_MODEL = "claude-sonnet-4-6";
-const FIX_MODEL = "claude-haiku-4-5";
 
 const client = new Anthropic();
-
-// ─── VLM image helpers ────────────────────────────────────────────────────────
-
-/** Resize a section screenshot to a resolution optimised for Claude VLM input. */
-export async function resizeForVlm(buf: Buffer): Promise<Buffer> {
-  return sharp(buf)
-    .resize({ width: 1024, withoutEnlargement: true })
-    .jpeg({ quality: 80 })
-    .toBuffer();
-}
 
 // ─── Fidelity budget ──────────────────────────────────────────────────────────
 
 export interface FidelityBudget {
-  minIterations: number;
-  maxIterations: number;
   /** Hard cap for initial generation. null = use estimateMaxTokens() dynamically. */
   generateMaxTokens: number | null;
-  /** Max tokens for Haiku full-document rewrite. null = use estimateMaxTokens() dynamically. */
-  patchMaxTokens: number | null;
-  /** Max tokens for the section VLM comparison call. */
-  sectionVlmMaxTokens: number;
 }
 
 const FIDELITY_BUDGETS: Record<FidelityMode, FidelityBudget> = {
-  minimal:  { minIterations: 0,  maxIterations: 0,  generateMaxTokens: 8_000,  patchMaxTokens: null,   sectionVlmMaxTokens: 512   },
-  fast:     { minIterations: 2,  maxIterations: 3,  generateMaxTokens: 12_000, patchMaxTokens: 32_768, sectionVlmMaxTokens: 512   },
-  balanced: { minIterations: 3,  maxIterations: 6,  generateMaxTokens: null,   patchMaxTokens: null,   sectionVlmMaxTokens: 1_024 },
-  high:     { minIterations: 4,  maxIterations: 8,  generateMaxTokens: null,   patchMaxTokens: 65_536, sectionVlmMaxTokens: 1_024 },
-  maximal:  { minIterations: 6,  maxIterations: 12, generateMaxTokens: null,   patchMaxTokens: 65_536, sectionVlmMaxTokens: 2_048 },
+  minimal:  { generateMaxTokens: 8_000  },
+  fast:     { generateMaxTokens: 12_000 },
+  balanced: { generateMaxTokens: null   },
+  high:     { generateMaxTokens: null   },
+  maximal:  { generateMaxTokens: null   },
 };
 
 const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
@@ -132,14 +110,36 @@ export function assembleSkeleton(
  * Runs independently so all section agents can execute in parallel —
  * every section is generated at output position zero, eliminating attention decay.
  */
+/** Extract the :root CSS custom-property block from skeleton HTML (if present). */
+function extractRootCssVars(html: string): string {
+  const styleMatch = html.match(/<style[^>]*>([\s\S]*?)<\/style>/i);
+  if (!styleMatch) return "";
+  const rootMatch = styleMatch[1].match(/(:root\s*\{[^}]*\})/);
+  return rootMatch ? rootMatch[1].trim() : "";
+}
+
+/**
+ * Extract the opening tag of a section shell from the skeleton HTML.
+ * Returns just the opening tag string, e.g. `<section class="bg-[#0a2540] py-24" data-section-slug="hero">`.
+ */
+function extractShellTag(skeletonHtml: string, slug: string): string | undefined {
+  const escapedSlug = slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = skeletonHtml.match(
+    new RegExp(`<[a-zA-Z][a-zA-Z0-9]*(?:[^>]*)data-section-slug="${escapedSlug}"(?:[^>]*)>`),
+  );
+  return match?.[0];
+}
+
 export async function generateSection(
-  section: { slug: string; description: string; role: string; order: number },
+  section: { slug: string; description: string; role: string; order: number; heightPx: number },
   neighborSlugs: { prev?: string; next?: string },
   screenshots: Buffer[],
   computedStyles: { selector: string; color: string; backgroundColor: string; fontSize: string; fontFamily: string }[],
   fontFamilies: string[],
   imageUrls: string[],
   url: string,
+  cssVars?: string,
+  shellContext?: { self: string; prev?: string; next?: string },
 ): Promise<{ slug: string; fragment: string; tokensIn: number; tokensOut: number }> {
   let fragment: string | null = null;
 
@@ -176,30 +176,38 @@ export async function generateSection(
     });
   }
 
-  const neighborLines = [
-    neighborSlugs.prev ? `Previous section: "${neighborSlugs.prev}"` : null,
-    neighborSlugs.next ? `Next section: "${neighborSlugs.next}"` : null,
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const shellContextBlock = shellContext
+    ? `<shell_context>
+Your section's shell element (already in the DOM — do NOT redeclare its tag, background, or padding):
+${shellContext.self}${shellContext.prev ? `
+
+Shell of the section immediately above yours:
+${shellContext.prev}` : ""}${shellContext.next ? `
+
+Shell of the section immediately below yours:
+${shellContext.next}` : ""}
+</shell_context>\n\n`
+    : "";
 
   contentBlocks.push({
     type: "text",
-    text: `The image(s) above show section "${section.slug}" (role: ${section.role}, position ${section.order}) from the source page at ${url}.
+    text: `The image(s) above show section "${section.slug}" (role: ${section.role}, position ${section.order}) from the source page.
 Description: ${section.description}
+Source section height: approximately ${section.heightPx}px at 1280px viewport width — match this vertical extent closely.
 
-${neighborLines ? `Context:\n${neighborLines}\n\n` : ""}Your task: generate the interior HTML fragment for this section.
+Your task: generate the interior HTML fragment for this section.
 
 FRAGMENT RULES — strictly enforced:
 - Output ONLY interior content (headings, paragraphs, images, buttons, layout divs)
 - No <html>, <head>, <body>, <style>, or <script> tags
 - No Tailwind config block, no font imports, no CSS custom property declarations
-- No document-level wrapper elements
-- Use Tailwind utility classes and any CSS custom properties (--brand-*, etc.) already defined in the skeleton
+- Do NOT add a root semantic container (<section>, <footer>, <header>, <article>, <nav>, <main>) — the shell element in <shell_context> already provides that wrapper; start directly with interior content
+- Do NOT redeclare background color, padding, or margin that is already set on your shell element
+- Use Tailwind utility classes and the CSS custom properties defined in <skeleton_css_vars> below — do not hardcode hex colours that are already named tokens
 - Use absolute image URLs from the list below so assets resolve correctly
 - Faithfully reproduce the section's layout, typography, content, and visual style from the screenshot(s)
 
-<computed_styles>
+${shellContextBlock}${cssVars ? `<skeleton_css_vars>\n${cssVars}\n</skeleton_css_vars>\n\n` : ""}<computed_styles>
 ${stylesJson}
 </computed_styles>
 
@@ -325,18 +333,6 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
 
   const budget = FIDELITY_BUDGETS[opts.fidelity ?? "balanced"];
   const sectionCount = archDoc.sections.length;
-  const { resolvedMaxIter, rawBudget } = computeIterBudget(sectionCount, budget);
-
-  if (budget.maxIterations > 0 && rawBudget > budget.maxIterations) {
-    const fidelityMode = opts.fidelity ?? "balanced";
-    const modeOrder: FidelityMode[] = ["fast", "balanced", "high", "maximal"];
-    const nextMode = modeOrder[modeOrder.indexOf(fidelityMode as FidelityMode) + 1];
-    const pct = Math.round((resolvedMaxIter / rawBudget) * 100);
-    const suggestion = nextMode ? ` Consider --fidelity ${nextMode}.` : "";
-    console.warn(
-      `[budget] Site has ${sectionCount} sections; ${fidelityMode} mode covers ~${pct}% of raw budget (${resolvedMaxIter}/${rawBudget} iterations).${suggestion}`,
-    );
-  }
 
   logger.log({
     phase: "fetch",
@@ -349,7 +345,6 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
       imageCount: crawlResult.imageUrls.length,
       fontCount: crawlResult.fontFamilies.length,
       sectionCount,
-      resolvedMaxIter,
       fidelityMode: opts.fidelity ?? "balanced",
     },
   });
@@ -391,6 +386,15 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     },
   });
 
+  // Whether any section shell already covers the page's primary navigation.
+  // When true the skeleton must NOT also render a standalone global nav — the
+  // section agent filling that shell will own it.  When false (e.g. the nav
+  // is fixed/sticky and therefore NOT in the section list), the skeleton
+  // should render it as a global fixed element from fixed_elements_html.
+  const navIsSection = archDoc.sections.some(
+    (s) => s.role === "navbar" || s.role === "header",
+  );
+
   const screenshotBuf = Buffer.from(crawlResult.screenshotBase64, "base64");
   const resizedFullPage = await resizeForVlm(screenshotBuf);
 
@@ -415,7 +419,9 @@ SKELETON CONTRACT — strictly enforced:
    - Complete <head>: charset, viewport, title, font imports, Tailwind CDN script tag
    - Tailwind config block (<script>tailwind.config = {...}</script>) with theme.extend containing CSS custom properties for brand colours, fonts, and spacing extracted from the source
    - CSS custom properties in a <style> :root block for any values that cannot be expressed as Tailwind config
-   - Navigation / header element: fully rendered with real content (logo, nav links, CTA buttons)
+   - ${navIsSection
+     ? "Do NOT render a standalone <nav> or <header> element outside the section shells — the visual architecture spec already has a navbar/header section, and the section agent filling that shell will handle all navigation content. Rendering it here too will create a duplicate."
+     : "Global navigation elements present in <fixed_elements_html> should be rendered as fixed/sticky elements in the document shell (e.g. a sticky <header> or <nav>)."}
    - All fixed/sticky elements listed in <fixed_elements_html>: use their structure and content as reference, but rewrite using Tailwind utility classes — do not copy source-site class names verbatim as they belong to a different CSS system
    - Page-level layout wrappers (<main>, outer container divs) with correct spacing and background
 
@@ -495,10 +501,18 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
   let sectionTokensOut = 0;
 
   if (skeletonHtml) {
+    const skeleton = skeletonHtml;
     console.log(`\n[gen] Stage 2 — ${archDoc.sections.length} section agents (parallel)...`);
+    const rootCssVars = extractRootCssVars(skeleton);
     const sectionResults = await Promise.all(
-      archDoc.sections.map((section, i) =>
-        generateSection(
+      archDoc.sections.map((section, i) => {
+        const selfTag = extractShellTag(skeleton, section.slug);
+        const prevTag = i > 0 ? extractShellTag(skeleton, archDoc.sections[i - 1].slug) : undefined;
+        const nextTag = i < archDoc.sections.length - 1 ? extractShellTag(skeleton, archDoc.sections[i + 1].slug) : undefined;
+        const shellContext = selfTag
+          ? { self: selfTag, prev: prevTag, next: nextTag }
+          : undefined;
+        return generateSection(
           section,
           {
             prev: archDoc.sections[i - 1]?.slug,
@@ -509,8 +523,10 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
           crawlResult.fontFamilies,
           crawlResult.imageUrls,
           url,
-        ),
-      ),
+          rootCssVars || undefined,
+          shellContext,
+        );
+      }),
     );
 
     for (const r of sectionResults) {
@@ -524,7 +540,7 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
 
     // ── Stage 3: Programmatic Assembly ────────────────────────────────────
     console.log(`\n[gen] Stage 3 — assembling...`);
-    const assembledHtml = assembleSkeleton(skeletonHtml, sectionFragments);
+    const assembledHtml = assembleSkeleton(skeleton, sectionFragments);
     const assembledFilename = `${skeletonBasename ?? "page"}.html`;
     const assembledPath = path.join(mainDir, assembledFilename);
     fs.writeFileSync(assembledPath, assembledHtml, "utf-8");
@@ -546,12 +562,10 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
     },
   });
 
-  let generateTokensIn = skeletonIn + sectionTokensIn;
-  let generateTokensOut = skeletonOut + sectionTokensOut;
-  let fixTokensIn = 0;
-  let fixTokensOut = 0;
+  const generateTokensIn = skeletonIn + sectionTokensIn;
+  const generateTokensOut = skeletonOut + sectionTokensOut;
 
-  // ─── Run record (hoisted — iterations populated by loop below) ──────────────
+  // ─── Run record ──────────────────────────────────────────────────────────────
   const record: RunRecord = {
     runId,
     ...(opts.name ? { name: opts.name } : {}),
@@ -562,139 +576,9 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
     estimatedCostUsd: 0,
   };
 
-  // ─── Iterative fidelity loop ────────────────────────────────────────────────
-  const MAX_ITER = resolvedMaxIter;
-
-  if (savedPath) {
-    for (let i = 0; i < MAX_ITER; i++) {
-      console.log(`\n[fidelity] Iteration ${i + 1}/${MAX_ITER} — scoring sections...`);
-
-      const genSections = await screenshotSectionsBySlug({ file: savedPath! }, archDoc);
-      const { discrepancies, matched, unmatched, aggregateScore } = await computeSectionDiscrepancies(
-        crawlResult.sourceSectionScreenshots,
-        genSections,
-        archDoc,
-        { maxTokens: budget.sectionVlmMaxTokens },
-      );
-      const severity = scoreSeverity(aggregateScore);
-
-      logger.log({
-        phase: "diff",
-        timestamp: Date.now(),
-        data: { iteration: i + 1, vlmScore: aggregateScore, matched, unmatched, discrepancyCount: discrepancies.length },
-      });
-
-      const iterRecord: IterationRecord = {
-        iteration: i + 1,
-        matched,
-        unmatched,
-        vlmScore: aggregateScore,
-        severity,
-        discrepancyCount: discrepancies.length,
-      };
-
-      console.log(
-        `[fidelity] ${matched}/${matched + unmatched} sections matched | VLM: ${aggregateScore.toFixed(3)} (${severity}) | ${discrepancies.length} discrepancies`,
-      );
-
-      if (discrepancies.length === 0) {
-        console.log("[fidelity] No discrepancies — converged.");
-        record.iterations.push(iterRecord);
-        break;
-      }
-
-      record.iterations.push(iterRecord);
-
-      // ── Patch pass ────────────────────────────────────────────────────────
-      const currentFilePath = savedPath!;
-      const currentHtml = fs.readFileSync(currentFilePath, "utf-8");
-      savedPath = null;
-
-      const fixSaveFile = betaZodTool({
-        name: "save_file",
-        description: "Save the rewritten HTML page to disk.",
-        inputSchema: z.object({
-          filename: z.string().describe("Same kebab-case filename as the original."),
-          content: z.string().describe("The complete rewritten HTML content of the page."),
-        }),
-        run: async (input) => {
-          const outPath = path.join(mainDir, input.filename);
-          fs.writeFileSync(outPath, input.content, "utf-8");
-          savedPath = outPath;
-          return JSON.stringify({ success: true, file_path: outPath });
-        },
-      });
-
-      const discrepancyList = discrepancies
-        .map((d) => {
-          const spec = archDoc.sections.find((s) => s.slug === d.slug);
-          return `[${d.severity}] ${d.slug} (${spec?.role ?? "section"}): ${d.issues.join("; ")}`;
-        })
-        .join("\n");
-
-      const fixStart = Date.now();
-      // Always allocate enough tokens to emit the full HTML plus 25% headroom.
-      // Haiku caps at 32K output; if the page needs more, bump to Sonnet's 64K ceiling.
-      const htmlTokenEstimate = Math.ceil(currentHtml.length / 4);
-      const patchTokensNeeded = Math.ceil(htmlTokenEstimate * 1.25);
-      const fixMaxTokens = budget.patchMaxTokens ?? Math.min(patchTokensNeeded, 32_768);
-      const fixRunner = client.beta.messages.toolRunner({
-        model: FIX_MODEL,
-        max_tokens: fixMaxTokens,
-        tools: [fixSaveFile],
-        tool_choice: { type: "tool", name: "save_file" },
-        stream: true,
-        max_iterations: 1,
-        system: `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. Rewrite the complete HTML document fixing the listed discrepancies. Preserve sections that are already correct. All sections MUST keep their data-section-slug and data-section-order attributes.`,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "image",
-                source: { type: "base64", media_type: "image/png", data: crawlResult.screenshotBase64 },
-              },
-              {
-                type: "text",
-                text: `SOURCE page above.\n\n<visual_architecture>\n${archDocText}\n</visual_architecture>\n\n<discrepancies>\n${discrepancyList}\n</discrepancies>\n\nRewrite the complete HTML fixing the listed discrepancies. Each section root MUST carry its data-section-slug and data-section-order attributes.\n\n<current_html>\n${currentHtml}\n</current_html>`,
-              },
-            ],
-          },
-        ],
-      });
-
-      const { tokensIn: fixIn, tokensOut: fixOut } = await renderStream(fixRunner);
-      const fixDurationMs = Date.now() - fixStart;
-      fixTokensIn += fixIn;
-      fixTokensOut += fixOut;
-
-      logger.log({
-        phase: "fix",
-        timestamp: Date.now(),
-        data: {
-          iteration: i + 1,
-          model: FIX_MODEL,
-          tokensIn: fixIn,
-          tokensOut: fixOut,
-          durationMs: fixDurationMs,
-          htmlSizeDelta: savedPath
-            ? fs.readFileSync(savedPath, "utf-8").length - currentHtml.length
-            : 0,
-        },
-      });
-
-      if (!savedPath) {
-        console.log("[fidelity] Fix pass did not save a file — stopping loop.");
-        break;
-      }
-    }
-  }
-
   // ─── Cost + record finalisation ─────────────────────────────────────────────
   record.completedAt = Date.now();
-  record.estimatedCostUsd =
-    estimateCost(GENERATE_MODEL, generateTokensIn, generateTokensOut) +
-    estimateCost(FIX_MODEL, fixTokensIn, fixTokensOut);
+  record.estimatedCostUsd = estimateCost(GENERATE_MODEL, generateTokensIn, generateTokensOut);
 
   let baselineSavedPath: string | null = null;
 

@@ -25,12 +25,11 @@
 import "dotenv/config";
 import * as fs from "fs";
 import * as path from "path";
-import sharp from "sharp";
 import { crawlAndPreprocess } from "../src/context";
 import { renderStream } from "../src/render";
+import { resizeForVlm } from "../src/image";
 import {
   GENERATE_MODEL,
-  resizeForVlm,
   formatArchDoc,
   assembleSkeleton,
   generateSection,

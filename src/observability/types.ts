@@ -13,6 +13,8 @@ export interface SectionSpec {
   description: string;
   role: string;
   order: number;
+  /** Pixel height of the section in the source page at the crawl viewport. */
+  heightPx: number;
 }
 
 export interface VisualArchDoc {

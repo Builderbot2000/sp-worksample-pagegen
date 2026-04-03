@@ -30,32 +30,3 @@ export function estimateCost(
     (tokensOut / 1_000_000) * pricing.output
   );
 }
-
-
-
-// \u2500\u2500\u2500 Iteration budget \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-
-import type { FidelityBudget } from "../agent";
-
-/**
- * Compute the resolved iteration count for a run, scaled to the source page's
- * section count, clamped within the mode's min/max range.
- *
- * Formula:
- *   rawBudget       = ceil(sectionCount * 0.5) + 1
- *   resolvedMaxIter = clamp(rawBudget, minIterations, maxIterations)
- */
-export function computeIterBudget(
-  sectionCount: number,
-  budget: FidelityBudget,
-): { resolvedMaxIter: number; rawBudget: number } {
-  if (budget.maxIterations === 0) {
-    return { resolvedMaxIter: 0, rawBudget: 0 };
-  }
-  const rawBudget = Math.ceil(sectionCount * 0.5) + 1;
-  const resolvedMaxIter = Math.max(
-    budget.minIterations,
-    Math.min(budget.maxIterations, rawBudget),
-  );
-  return { resolvedMaxIter, rawBudget };
-}
