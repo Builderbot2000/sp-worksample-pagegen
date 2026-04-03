@@ -42,7 +42,7 @@ Every section agent receives: the section's own screenshot(s) resized for VLM vi
 
 The model is instructed to produce only an interior HTML fragment — no `<html>`, `<head>`, `<body>`, `<style>`, or `<script>` tags, no outer semantic container (the shell already provides that), no redeclaration of background or padding already present on the shell. This keeps each agent's output at output-position-zero relative to its own section, eliminating the attention decay that degrades quality in single-pass full-page generation.
 
-Each agent calls a `save_section` tool with the slug and interior content. The fragment is captured in a closure and returned alongside token counts.
+Each agent calls a `save_section` tool with the slug and interior content. The tool runner allows `max_iterations: 2` so that if Zod validation rejects the first call (e.g. model omits the `content` field), the model receives the error and can retry on the second turn. The fragment is captured in a closure and returned alongside token counts.
 
 After all sections complete, the fragments and skeleton are merged by `assembleSkeleton`, which applies a regex with a backreference on the tag name to locate each shell by its `data-section-slug` attribute and inject the fragment between the opening and closing tag. Unmatched slugs are logged as warnings. The assembled file is written to `main/<name>.html`.
 
@@ -52,7 +52,7 @@ After all sections complete, the fragments and skeleton are merged by `assembleS
 
 When `--correction` is passed, a fidelity-driven correction loop runs after initial assembly. The number of iterations is controlled by the fidelity budget (`maxSectionIter`): 0 for minimal, 1 for fast, 2 for balanced, 3 for high, 4 for maximal.
 
-Each iteration begins by screenshotting the assembled HTML with Puppeteer, locating each section by its `data-section-slug` attribute. The per-section screenshots from the source and the reconstruction are then passed to `computeSectionDiscrepancies`, a single batched VLM call to `claude-sonnet-4-6` at `temperature: 0`. The model receives interleaved source/reconstruction screenshot pairs for up to 15 sections and returns a JSON array with a score (0–1), a verdict (`close`, `partial`, or `distant`), and up to three issue strings per section.
+Each iteration begins by screenshotting the assembled HTML with Puppeteer, locating each section by its `data-section-slug` attribute via `el.boundingBox()`. Sections that render to less than 4px, or to less than 25% of their source `heightPx`, are skipped — they are treated as collapsed shells and fed into the correction pass as missing sections rather than scoring them with a near-empty image. The per-section screenshots from the source and the reconstruction are then passed to `computeSectionDiscrepancies`. All matched sections are scored: they are chunked into batches of 5 pairs (`VLM_BATCH_SIZE`) and all batches are sent to `claude-sonnet-4-6` in parallel via `Promise.all`. Each call returns a JSON array with a score (0–1), a verdict (`close`, `partial`, or `distant`), and up to three issue strings per section. Both source and generated images are run through `resizeForVlm` (1024px JPEG) before being sent, consistent with all other VLM calls in the pipeline. If an individual batch call fails, only those sections fall back to a `"VLM scoring failed"` discrepancy; other batches are unaffected.
 
 Sections scoring below 0.85 are flagged for correction. All flagged sections are corrected in parallel by calling `generateSection` again, this time passing the issues list as `corrections`, the current reconstruction screenshot as `currentScreenshot`, and the current fragment HTML as `currentHtml`. The `currentHtml` is injected as a `<current_html>` block in the prompt with the instruction to modify it surgically rather than rewrite from scratch, preventing regressions in the parts that already match. The `currentScreenshot` gives the model a side-by-side visual of exactly what went wrong.
 
@@ -66,7 +66,7 @@ Each iteration writes an `iter-N-report.html` to `corrections/` containing a car
 
 ## Stage 3 — Fidelity Metrics (`src/observability/fidelity.ts`)
 
-After generation (and correction, if enabled) completes, `collectFidelityMetrics` runs a final VLM scoring pass on the assembled page. It captures full-page screenshots of the main output (and baseline if requested) and the per-section screenshots of the final assembled HTML, then runs `computeSectionDiscrepancies` once more to produce the final `mainVlmScore`. The aggregate score is the mean of per-section scores, with unmatched sections scoring 0 and sections beyond the 15-pair batch cap scoring 1 (they don't count against the page). The `FidelityMetrics` record is attached to the `RunRecord` and surfaced in the HTML report.
+After generation (and correction, if enabled) completes, `collectFidelityMetrics` runs a final VLM scoring pass on the assembled page. It captures full-page screenshots of the main output (and baseline if requested) and the per-section screenshots of the final assembled HTML, then runs `computeSectionDiscrepancies` once more to produce the final `mainVlmScore`. The aggregate score is the mean of per-section scores across all sections in `archDoc`. Sections absent from the generated HTML score 0; sections that were scored by a VLM batch use their returned score. In `buildVlmFidelityScore`, a section is labelled `"missing"` only when its discrepancy type is `"missing"` (genuinely absent from the DOM). Visual discrepancies — including those produced by a failed VLM call — are labelled `"partial"` regardless of their severity, accurately reflecting that the shell exists but rendered incorrectly. The `FidelityMetrics` record is attached to the `RunRecord` and surfaced in the HTML report.
 
 ---
 
@@ -129,7 +129,8 @@ The `Recorder` class opens a write stream to `run.ndjson` and appends a JSON lin
 | Max screenshot height | 7,800px | `context.ts`, `fidelity.ts` |
 | Section tall threshold (triggers descent) | 1,350px | `context.ts` |
 | Max sections per page | 20 | `context.ts` |
-| VLM batch cap (pairs per scorer call) | 15 | `fidelity.ts` |
+| VLM batch size (pairs per scorer call) | 5 | `fidelity.ts` |
+| Section screenshot min height ratio | 25% of source heightPx | `fidelity.ts` |
 | Section agent max tokens | 8,000 | `agent.ts` |
 | Correction threshold (score below triggers fix) | 0.85 | `agent.ts` |
 | Plateau delta (stops loop if improvement ≤) | 0.01 | `agent.ts` |
