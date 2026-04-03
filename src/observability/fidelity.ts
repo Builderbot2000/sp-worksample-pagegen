@@ -1,6 +1,7 @@
 import puppeteer from "puppeteer";
 import Anthropic from "@anthropic-ai/sdk";
 import * as path from "path";
+import { resizeForVlm } from "../image";
 import type {
   VlmFidelityScore,
   VlmVerdict,
@@ -12,8 +13,8 @@ import type {
 
 const VIEWPORT = { width: 1280, height: 900 };
 const MAX_SCREENSHOT_HEIGHT = 7800;
-// Max section pairs scored in a single VLM batch call
-const MAX_SECTION_PAIRS = 15;
+// Section pairs per VLM call — keep small to avoid context limit blowups on long pages
+const VLM_BATCH_SIZE = 5;
 
 const client = new Anthropic();
 
@@ -123,99 +124,126 @@ export async function computeSectionDiscrepancies(
     }
   }
 
-  // Subsample to stay within VLM batch budget
-  const toScore = matchedSlugs.slice(0, MAX_SECTION_PAIRS);
-
   let tokensIn = 0;
   let tokensOut = 0;
 
-  if (toScore.length > 0) {
-    const userContent: Anthropic.MessageParam["content"] = [];
-    for (const slug of toScore) {
-      const sourceImgs = sourceSections[slug] ?? [];
-      const genImgs = genSections[slug] ?? [];
-      const spec = archDoc.sections.find((s) => s.slug === slug);
-      const label = spec ? `${slug} (${spec.role})` : slug;
-
-      userContent.push({
-        type: "image",
-        source: { type: "base64", media_type: "image/png", data: sourceImgs[0].toString("base64") },
-      });
-      userContent.push({ type: "text", text: `Section "${label}" — SOURCE above.` });
-
-      userContent.push({
-        type: "image",
-        source: { type: "base64", media_type: "image/png", data: genImgs[0].toString("base64") },
-      });
-      userContent.push({ type: "text", text: `Section "${label}" — RECONSTRUCTION above.` });
+  if (matchedSlugs.length > 0) {
+    // Split all matched slugs into small batches and score in parallel
+    const batches: string[][] = [];
+    for (let i = 0; i < matchedSlugs.length; i += VLM_BATCH_SIZE) {
+      batches.push(matchedSlugs.slice(i, i + VLM_BATCH_SIZE));
     }
-    userContent.push({
-      type: "text",
-      text: "Evaluate each section and respond with the JSON array only.",
-    });
 
-    try {
-      const response = await client.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: opts?.maxTokens ?? 512 + 256 * toScore.length,
-        temperature: 0,
-        system: SECTION_VLM_SYSTEM,
-        messages: [{ role: "user", content: userContent }],
-      });
+    const batchResults = await Promise.all(
+      batches.map(async (batch) => {
+        const userContent: Anthropic.MessageParam["content"] = [];
+        for (const slug of batch) {
+          const sourceImgs = sourceSections[slug] ?? [];
+          const genImgs = genSections[slug] ?? [];
+          const spec = archDoc.sections.find((s) => s.slug === slug);
+          const label = spec ? `${slug} (${spec.role})` : slug;
+          const [srcResized, genResized] = await Promise.all([
+            resizeForVlm(sourceImgs[0]),
+            resizeForVlm(genImgs[0]),
+          ]);
+          userContent.push({
+            type: "image",
+            source: { type: "base64", media_type: "image/jpeg", data: srcResized.toString("base64") },
+          });
+          userContent.push({ type: "text", text: `Section "${label}" — SOURCE above.` });
+          userContent.push({
+            type: "image",
+            source: { type: "base64", media_type: "image/jpeg", data: genResized.toString("base64") },
+          });
+          userContent.push({ type: "text", text: `Section "${label}" — RECONSTRUCTION above.` });
+        }
+        userContent.push({ type: "text", text: "Evaluate each section and respond with the JSON array only." });
 
-      tokensIn = response.usage.input_tokens;
-      tokensOut = response.usage.output_tokens;
-      const text = response.content.find((b) => b.type === "text")?.text ?? "";
-      const cleaned = text.replace(/^```[^\n]*\n?|```$/gm, "").trim();
-      const parsed = JSON.parse(cleaned) as unknown[];
+        try {
+          const response = await client.messages.create({
+            model: "claude-sonnet-4-6",
+            max_tokens: opts?.maxTokens ?? 512 + 256 * batch.length,
+            temperature: 0,
+            system: SECTION_VLM_SYSTEM,
+            messages: [{ role: "user", content: userContent }],
+          });
+          return {
+            batch,
+            text: response.content.find((b) => b.type === "text")?.text ?? "",
+            tokensIn: response.usage.input_tokens,
+            tokensOut: response.usage.output_tokens,
+          };
+        } catch (err) {
+          console.error(`[fidelity] VLM batch failed [${batch.join(", ")}]:`, err);
+          return { batch, text: null, tokensIn: 0, tokensOut: 0 };
+        }
+      }),
+    );
 
-      if (Array.isArray(parsed)) {
-        for (const d of parsed) {
-          if (typeof d !== "object" || d === null || !("slug" in d) || !("score" in d) || !("verdict" in d))
-            continue;
-          const item = d as { slug: string; score: number; verdict: string; issues?: unknown[] };
-          // VLM receives labels like "section-1 (hero)" and echoes them back — strip the role suffix
-          const slug = item.slug.replace(/\s*\([^)]*\)\s*$/, "").trim();
-          const score = Math.max(0, Math.min(1, Number(item.score)));
-          const verdict: VlmVerdict = ["close", "partial", "distant"].includes(item.verdict)
-            ? (item.verdict as VlmVerdict)
-            : "distant";
-          const issues = Array.isArray(item.issues)
-            ? (item.issues as unknown[]).filter((s): s is string => typeof s === "string").slice(0, 3)
-            : [];
-          sectionScores[slug] = score;
-          if (verdict !== "close") {
+    for (const result of batchResults) {
+      tokensIn += result.tokensIn;
+      tokensOut += result.tokensOut;
+
+      if (result.text === null) {
+        for (const slug of result.batch) {
+          if (sectionScores[slug] === undefined) {
+            sectionScores[slug] = 0;
             discrepancies.push({
               slug,
               type: "visual",
-              severity: verdict === "distant" ? "high" : "medium",
-              issues,
-              score,
+              severity: "high",
+              issues: ["VLM scoring failed for this section"],
+              score: 0,
+            });
+          }
+        }
+        continue;
+      }
+
+      const cleaned = result.text.replace(/^```[^\n]*\n?|```$/gm, "").trim();
+      try {
+        const parsed = JSON.parse(cleaned) as unknown[];
+        if (Array.isArray(parsed)) {
+          for (const d of parsed) {
+            if (typeof d !== "object" || d === null || !("slug" in d) || !("score" in d) || !("verdict" in d))
+              continue;
+            const item = d as { slug: string; score: number; verdict: string; issues?: unknown[] };
+            // VLM receives labels like "section-1 (hero)" and echoes them back — strip the role suffix
+            const slug = item.slug.replace(/\s*\([^)]*\)\s*$/, "").trim();
+            const score = Math.max(0, Math.min(1, Number(item.score)));
+            const verdict: VlmVerdict = ["close", "partial", "distant"].includes(item.verdict)
+              ? (item.verdict as VlmVerdict)
+              : "distant";
+            const issues = Array.isArray(item.issues)
+              ? (item.issues as unknown[]).filter((s): s is string => typeof s === "string").slice(0, 3)
+              : [];
+            sectionScores[slug] = score;
+            if (verdict !== "close") {
+              discrepancies.push({
+                slug,
+                type: "visual",
+                severity: verdict === "distant" ? "high" : "medium",
+                issues,
+                score,
+              });
+            }
+          }
+        }
+      } catch {
+        // JSON parse failed — mark the whole batch as failed
+        for (const slug of result.batch) {
+          if (sectionScores[slug] === undefined) {
+            sectionScores[slug] = 0;
+            discrepancies.push({
+              slug,
+              type: "visual",
+              severity: "high",
+              issues: ["VLM scoring failed for this section"],
+              score: 0,
             });
           }
         }
       }
-    } catch {
-      // VLM failed — treat all matched sections as needing a fix pass
-      for (const slug of toScore) {
-        if (sectionScores[slug] === undefined) {
-          sectionScores[slug] = 0;
-          const spec = archDoc.sections.find((s) => s.slug === slug);
-          discrepancies.push({
-            slug,
-            type: "visual",
-            severity: "high",
-            issues: ["VLM scoring failed for this section"],
-            score: 0,
-          });
-        }
-      }
-    }
-
-    // Sections beyond MAX_SECTION_PAIRS are unscored — assume correct (score=1)
-    // to avoid penalising long pages for an arbitrary batch cap
-    for (const slug of matchedSlugs.slice(MAX_SECTION_PAIRS)) {
-      sectionScores[slug] = 1;
     }
   }
 
@@ -325,7 +353,8 @@ function buildVlmFidelityScore(
     } else if (disc.type === "missing") {
       sections[spec.slug] = "missing";
     } else {
-      sections[spec.slug] = disc.severity === "high" ? "missing" : "partial";
+      // Visual discrepancies: section is present but mismatched — never "missing"
+      sections[spec.slug] = "partial";
     }
   }
 
