@@ -44,6 +44,8 @@ export interface CrawlResult {
   svgs: string[];
   visualArchDoc: VisualArchDoc;
   sourceSectionScreenshots: Record<string, Buffer[]>;
+  /** outerHTML of top-level fixed/sticky elements, truncated to 3 KB each. */
+  fixedElementsHtml: string[];
 }
 
 // ─── Main crawl function ──────────────────────────────────────────────────────
@@ -291,6 +293,34 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
         });
     });
 
+    // ── outerHTML of top-level fixed/sticky elements ──────────────────────────
+    // Only elements whose initial bounding rect starts within the viewport
+    // (top < VIEWPORT.height) are considered global — mid-page sticky elements
+    // that only appear on scroll belong inside sections, not the global shell.
+    const fixedElementsHtml = await page.evaluate((viewportHeight: number) => {
+      const MAX_CHARS = 3000;
+      const all = Array.from(document.querySelectorAll("*")).filter((el) => {
+        const pos = getComputedStyle(el).position;
+        return pos === "fixed" || pos === "sticky";
+      });
+      // Keep only top-level (parent not also fixed/sticky)
+      const topLevel = all.filter((el) => {
+        const parent = el.parentElement;
+        if (!parent) return true;
+        const parentPos = getComputedStyle(parent).position;
+        return parentPos !== "fixed" && parentPos !== "sticky";
+      });
+      // Filter to elements visible at page load (initial rect top within viewport)
+      const initialViewport = topLevel.filter((el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.top < viewportHeight;
+      });
+      return initialViewport.slice(0, 5).map((el) => {
+        const h = el.outerHTML;
+        return h.length > MAX_CHARS ? h.slice(0, MAX_CHARS) + "<!-- truncated -->" : h;
+      });
+    }, VIEWPORT.height);
+
     // ── Build arch doc from DOM data ──────────────────────────────────────────
     const archDocSections: SectionSpec[] = dedupedSections.map((s, i) => ({
       slug: s.slug,
@@ -310,6 +340,7 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
       svgs: extracted.svgs,
       visualArchDoc: { sections: archDocSections, fixedElements, backgroundDescription: "" },
       sourceSectionScreenshots,
+      fixedElementsHtml,
     };
   } finally {
     await browser.close();

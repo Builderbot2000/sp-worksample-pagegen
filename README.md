@@ -88,9 +88,28 @@ Output goes to `output/<timestamp>-<name|preprocess-test>/` and includes `arch.j
 npm run test:preprocess -- https://stripe.com/payments --name stripe-preprocessing-test
 ```
 
+### Skeleton test
+
+Runs the crawl + Stage 1 skeleton generation in isolation. Useful for verifying that the skeleton agent correctly renders all global elements (nav, fonts, CSS custom properties, Tailwind config) and produces empty labeled section shells — before committing to the full parallel pipeline run.
+
+```sh
+npm run test:skeleton -- <url>
+npm run test:skeleton -- <url> --name <label>
+npm run test:skeleton -- <url> --name <label> --out <dir>
+```
+
+Output goes to `output/<timestamp>-<name|skeleton-test>/` and includes `main/<page>-skeleton.html`, `screenshot.png`, `arch.json`, and `report.html`.
+
+The report shows the section shell table (slug, role, description) so you can cross-check which shells the model was asked to produce. Open `main/<page>-skeleton.html` directly to verify global elements are rendered and section interiors are blank.
+
+```sh
+# Example
+npm run test:skeleton -- https://stripe.com/payments --name stripe-skeleton-test
+```
+
 ### Generate test
 
-Runs the crawl + initial generation step in isolation (no fidelity loop, no patching). Useful for iterating on the generation prompt without waiting for the full pipeline.
+Runs the crawl + full initial generation (skeleton → parallel section agents → assembly) in isolation (no fidelity loop, no patching). Useful for iterating on the generation prompts without waiting for the full pipeline.
 
 ```sh
 npm run test:generate -- <url>

@@ -138,6 +138,7 @@ async function main() {
   const stylesJson = JSON.stringify(crawlResult.computedStyles, null, 2);
   const fontsText = crawlResult.fontFamilies.join(", ");
   const imageUrlsText = crawlResult.imageUrls.join("\n");
+  const svgsText = crawlResult.svgs.join("\n");
   const slugList = crawlResult.visualArchDoc.sections
     .map((s) => `  ${s.order}. "${s.slug}" (${s.role})`)
     .join("\n");
@@ -170,6 +171,7 @@ async function main() {
   const runner = client.beta.messages.toolRunner({
     model: SKELETON_MODEL,
     max_tokens: estimateMaxTokens(crawlResult.html.length, SKELETON_MODEL),
+    thinking: { type: "disabled" },
     tools: [saveFile],
     tool_choice: { type: "tool", name: "save_file" },
     stream: true,
@@ -187,7 +189,7 @@ SKELETON CONTRACT — strictly enforced:
    - Tailwind config block (<script>tailwind.config = {...}</script>) with theme.extend containing CSS custom properties for brand colours, fonts, and spacing extracted from the source
    - CSS custom properties in a <style> :root block for any values that cannot be expressed as Tailwind config
    - Navigation / header element: fully rendered with real content (logo, nav links, CTA buttons)
-   - Any fixed or sticky elements: fully rendered
+   - All fixed/sticky elements listed in <fixed_elements_html>: use their structure and content as reference, but rewrite using Tailwind utility classes — do not copy source-site class names verbatim as they belong to a different CSS system
    - Page-level layout wrappers (<main>, outer container divs) with correct spacing and background
 
 2. SECTION SHELLS must be empty:
@@ -213,7 +215,7 @@ SKELETON CONTRACT — strictly enforced:
           },
           {
             type: "text",
-            text: `The image above is a low-resolution screenshot of the source page at ${urlArg}. Use it as a visual reference for global styles, colour palette, typography, and overall layout structure.
+            text: `The image above is a screenshot of the source page at ${urlArg}. Use it as a visual reference for global styles, colour palette, typography, and overall layout structure.
 
 Your task is to generate the SKELETON HTML for this page. The skeleton must include all global elements (head, fonts, CSS variables, Tailwind theme config, nav) fully rendered, with one empty shell element for each section listed below. Section shells must be empty — downstream agents will fill in the content.
 
@@ -235,6 +237,14 @@ ${fontsText}
 <image_urls>
 ${imageUrlsText}
 </image_urls>
+
+<svgs>
+${svgsText}
+</svgs>
+
+<fixed_elements_html>
+${crawlResult.fixedElementsHtml.join("\n\n")}
+</fixed_elements_html>
 
 <source_html>
 ${crawlResult.html}
