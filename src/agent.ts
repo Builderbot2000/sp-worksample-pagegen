@@ -7,8 +7,8 @@ import { Logger } from "./observability/logger";
 import { estimateCost } from "./observability/metrics";
 import { collectFidelityMetrics } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
-import type { RunRecord, FidelityMode, FidelityBudget } from "./observability/types";
-export type { FidelityBudget };
+import type { RunRecord, QualityMode, QualityBudget } from "./observability/types";
+export type { QualityBudget };
 import { formatArchDoc, assembleSkeleton, extractRootCssVars, extractShellTag, assembleNeighbour } from "./pipeline/assembly";
 export { formatArchDoc, assembleSkeleton, extractShellTag, assembleNeighbour };
 import { runSkeletonAgent } from "./pipeline/skeleton-agent";
@@ -16,26 +16,17 @@ import { generateSection } from "./pipeline/section-agent";
 export { generateSection };
 import { runBaseline } from "./pipeline/baseline-agent";
 import { runCorrectionLoop } from "./pipeline/correction-loop";
-import { MODELS } from "./config";
+import { MODELS, QUALITY_BUDGETS } from "./config";
 
 export const GENERATE_MODEL = MODELS.sectionInitial;
 const BASELINE_MODEL = MODELS.baseline;
 
-// ─── Fidelity budget ──────────────────────────────────────────────────────────────────────────────
-
-const FIDELITY_BUDGETS: Record<FidelityMode, FidelityBudget> = {
-  minimal:  { generateMaxTokens: 8_000,  maxSectionIter: 0 },
-  fast:     { generateMaxTokens: 12_000, maxSectionIter: 1 },
-  balanced: { generateMaxTokens: null,   maxSectionIter: 2 },
-  high:     { generateMaxTokens: null,   maxSectionIter: 3 },
-  maximal:  { generateMaxTokens: null,   maxSectionIter: 4 },
-};
 
 const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
 
 export interface GenerateOptions {
   name?: string;
-  fidelity?: FidelityMode;
+  quality?: QualityMode;
   baseline?: boolean;
   correction?: boolean;
   open?: boolean;
@@ -55,7 +46,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
 
   const crawlResult = await crawlAndPreprocess(url);
   const archDoc = crawlResult.visualArchDoc;
-  const budget = FIDELITY_BUDGETS[opts.fidelity ?? "balanced"];
+  const budget = QUALITY_BUDGETS[opts.quality ?? "standard"];
 
   logger.log({
     phase: "fetch",
@@ -68,7 +59,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
       imageCount: crawlResult.imageUrls.length,
       fontCount: crawlResult.fontFamilies.length,
       sectionCount: archDoc.sections.length,
-      fidelityMode: opts.fidelity ?? "balanced",
+      qualityMode: opts.quality ?? "standard",
     },
   });
 
@@ -89,7 +80,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
   // ── Stage 1: Skeleton Agent ──────────────────────────────────────────────────────
   console.log(`
 [gen] Stage 1 — skeleton (${GENERATE_MODEL})...`);
-  const skeletonResult = await runSkeletonAgent({ url, crawlResult, budget, mainDir });
+  const skeletonResult = await runSkeletonAgent({ url, crawlResult, mainDir });
   if (!skeletonResult) {
     console.error("[gen] Skeleton agent produced no output — aborting.");
     return null;
@@ -140,7 +131,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
   let correctionSectionTokensOut = 0;
 
   // ── Stage 2.5: Per-section correction loop ──────────────────────────────────────────
-  if (opts.correction && budget.maxSectionIter > 0) {
+  if (opts.correction && budget.maxCorrectionIter > 0) {
     const loopResult = await runCorrectionLoop({
       url,
       assembledPath,

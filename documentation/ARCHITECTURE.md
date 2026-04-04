@@ -4,7 +4,7 @@
 
 The system takes a public URL and produces a self-contained, Tailwind CSS page that visually replicates the source. The pipeline is multi-stage and LLM-driven: a preprocessing phase extracts structured knowledge from the live page, a skeleton LLM call establishes the document shell and global styles, then N section LLM agents run in parallel to fill in each section's content independently. An optional correction loop follows, driven by a VLM fidelity scorer that identifies visual discrepancies and targets only the sections that need fixing.
 
-All source is TypeScript, executed via `ts-node`. The entry point is `src/cli.ts`, which delegates to `generatePage()` in `src/agent.ts`. Output is written to `output/<timestamp>-<name>/`.
+All source is TypeScript, executed via `tsx`. The entry point is `src/cli.ts`, which delegates to `generatePage()` in `src/agent.ts`. Pipeline stages live in `src/pipeline/` (`skeleton-agent.ts`, `section-agent.ts`, `baseline-agent.ts`, `correction-loop.ts`, `assembly.ts`); prompt builders live in `src/prompts/`. Model names and quality budgets are centralised in `src/config.ts` — no model strings live in operational code. Output is written to `output/<timestamp>-<name>/`.
 
 ---
 
@@ -22,27 +22,27 @@ The function returns a `CrawlResult` containing all extracted data plus `caption
 
 ---
 
-## Stage 1 — Skeleton Generation (`src/agent.ts` → `generatePage`)
+## Stage 1 — Skeleton Generation (`src/pipeline/skeleton-agent.ts`)
 
 The skeleton agent receives the full-page screenshot, the serialised `VisualArchDoc`, the complete source HTML, computed styles, font families, image URLs, inline SVGs, and the `outerHTML` of fixed/sticky elements. It is instructed to produce a complete HTML document with all global infrastructure rendered — `<head>` with charset, viewport, title, and font imports; a Tailwind CDN `<script>` tag; a `tailwind.config` block with `theme.extend` containing brand colours and fonts as CSS custom properties; a `:root` style block for any values that cannot be Tailwind config tokens; and all fixed/sticky navigation elements fully rendered using Tailwind utility classes.
 
 Critically, section interiors are intentionally left empty. The agent emits one shell element per section, and each shell's outermost tag must carry exactly two attributes: `data-section-slug="<slug>"` and `data-section-order="<N>"`. No content goes inside the shells. This is the skeleton contract that makes deterministic assembly possible downstream. The model is told whether the page's navigation lives in a dedicated section (a `navbar` or `header` role section already in the list) — if so, it must not render a duplicate global nav element outside the shells.
 
-The skeleton agent uses `claude-sonnet-4-6` with streaming via the Anthropic Beta Tool Runner, forced to call a `save_file` tool that writes the HTML to `main/<name>-skeleton.html`. Token usage is read from the stream events and tracked separately as `skeletonIn` / `skeletonOut`.
+The skeleton agent uses the model configured as `MODELS.skeleton` in `src/config.ts`, with streaming via the Anthropic Beta Tool Runner, forced to call a `save_file` tool that writes the HTML to `main/<name>-skeleton.html`. Token usage is read from the stream events and tracked separately as `skeletonIn` / `skeletonOut`.
 
-The token budget for the skeleton call is dynamic: `estimateMaxTokens()` scales linearly between 16,000 and 64,000 tokens depending on source HTML length relative to the 80,000-character cap, unless the fidelity mode specifies a hard `generateMaxTokens` override.
+The token budget is dynamic: `estimateMaxTokens()` scales linearly between 16,000 and 64,000 tokens depending on source HTML length relative to the 80,000-character cap.
 
 ---
 
-## Stage 2 — Parallel Section Generation (`generateSection`)
+## Stage 2 — Parallel Section Generation (`src/pipeline/section-agent.ts`)
 
 Once the skeleton HTML is available, all sections are launched simultaneously via `Promise.all`. Each `generateSection` call runs independently with no shared mutable state, which is what makes full parallelism safe.
 
-Every section agent receives: the section's own screenshot(s) resized for VLM via `sharp` (1024px wide, JPEG 80%); the section's slug, role, order, description, and source height; the `:root` CSS custom properties extracted from the skeleton (so agents can use `var(--brand-color)` rather than hardcoded hex); the computed styles, font families, and image URL list; and a `shell_context` block containing the section's own opening shell tag plus the fully assembled neighbouring sections above and below (see `assembleNeighbour`).
+Every section agent receives: the section's own screenshot(s) resized for VLM via `sharp` (1024px wide, JPEG 80%); the section's slug, role, order, description, and source height; the `:root` CSS custom properties extracted from the skeleton; the computed styles, font families, and image URL list; and a `shell_context` block containing the section's own opening shell tag plus the fully assembled neighbouring sections above and below (see `assembleNeighbour`).
 
-The model is instructed to produce only an interior HTML fragment — no `<html>`, `<head>`, `<body>`, `<style>`, or `<script>` tags, no outer semantic container (the shell already provides that), no redeclaration of background or padding already present on the shell. This keeps each agent's output at output-position-zero relative to its own section, eliminating the attention decay that degrades quality in single-pass full-page generation.
+**The reference screenshot is the absolute ground truth.** The model is free to match it exactly — including overriding any background colour, padding, or spacing the skeleton placed on the shell element. If the skeleton produced an incorrect shell style, the section agent is expected to correct it on its outermost interior wrapper div. The only hard constraints are structural: no `<html>`, `<head>`, `<body>`, `<style>`, or `<script>` tags; no outer semantic container (the shell already provides that wrapper); no Tailwind config blocks or font imports.
 
-Each agent calls a `save_section` tool with the slug and interior content. The tool runner allows `max_iterations: 2` so that if Zod validation rejects the first call (e.g. model omits the `content` field), the model receives the error and can retry on the second turn. The fragment is captured in a closure and returned alongside token counts.
+Each agent calls a `save_section` tool with the slug and interior content. The tool runner allows `max_iterations: 2` so that if Zod validation rejects the first call the model receives the error and can retry. The fragment is captured in a closure and returned alongside token counts.
 
 After all sections complete, the fragments and skeleton are merged by `assembleSkeleton`, which applies a regex with a backreference on the tag name to locate each shell by its `data-section-slug` attribute and inject the fragment between the opening and closing tag. Unmatched slugs are logged as warnings. The assembled file is written to `main/<name>.html`.
 
@@ -50,15 +50,17 @@ After all sections complete, the fragments and skeleton are merged by `assembleS
 
 ## Stage 2.5 — Correction Loop (optional, `--correction`)
 
-When `--correction` is passed, a fidelity-driven correction loop runs after initial assembly. The number of iterations is controlled by the fidelity budget (`maxSectionIter`): 0 for minimal, 1 for fast, 2 for balanced, 3 for high, 4 for maximal.
+When `--correction` is passed, a fidelity-driven correction loop runs after initial assembly. The number of iterations is controlled by the quality budget (`maxCorrectionIter`): 0 for `draft`, 2 for `standard`, 3 for `quality` — all defined in `src/config.ts`.
 
-Each iteration begins by screenshotting the assembled HTML with Puppeteer, locating each section by its `data-section-slug` attribute via `el.boundingBox()`. Sections that render to less than 4px, or to less than 25% of their source `heightPx`, are skipped — they are treated as collapsed shells and fed into the correction pass as missing sections rather than scoring them with a near-empty image. The per-section screenshots from the source and the reconstruction are then passed to `computeSectionDiscrepancies`. All matched sections are scored: they are chunked into batches of 5 pairs (`VLM_BATCH_SIZE`) and all batches are sent to `claude-sonnet-4-6` in parallel via `Promise.all`. Each call returns a JSON array with a score (0–1), a verdict (`close`, `partial`, or `distant`), and up to three issue strings per section. Both source and generated images are run through `resizeForVlm` (1024px JPEG) before being sent, consistent with all other VLM calls in the pipeline. If an individual batch call fails, only those sections fall back to a `"VLM scoring failed"` discrepancy; other batches are unaffected.
+Each iteration begins by screenshotting the assembled HTML with Puppeteer, locating each section by its `data-section-slug` attribute via `el.boundingBox()`. Sections that render to less than 4px, or to less than 25% of their source `heightPx`, are skipped — they are treated as collapsed shells and fed into the correction pass as missing sections rather than scoring them with a near-empty image. The per-section screenshots from the source and the reconstruction are then passed to `computeSectionDiscrepancies`. All matched sections are scored: they are chunked into batches of 8 pairs (`VLM_BATCH_SIZE`) and all batches are sent to the VLM scorer model in parallel via `Promise.all`. Each call returns a JSON array with a score (0–1), a verdict (`close`, `partial`, or `distant`), and up to three issue strings per section. Both source and generated images are run through `resizeForVlm` (1024px JPEG) before being sent. If an individual batch call fails, only those sections fall back to a `"VLM scoring failed"` discrepancy; other batches are unaffected.
 
-Sections scoring below 0.85 are flagged for correction. All flagged sections are corrected in parallel by calling `generateSection` again, this time passing the issues list as `corrections`, the current reconstruction screenshot as `currentScreenshot`, and the current fragment HTML as `currentHtml`. The `currentHtml` is injected as a `<current_html>` block in the prompt with the instruction to modify it surgically rather than rewrite from scratch, preventing regressions in the parts that already match. The `currentScreenshot` gives the model a side-by-side visual of exactly what went wrong.
+Sections scoring below **0.70** are flagged for correction. After scoring, any section that is in the active set but did not make it into the flagged list is permanently added to `settledSlugs` — a set that grows across iterations. Settled sections are excluded from both VLM batches and re-generation in all subsequent iterations, meaning the scorer and correction agents focus only on sections that are still improving.
+
+All flagged sections are corrected in parallel by calling `generateSection` again, this time passing the issues list as `corrections` and the current fragment HTML as `currentHtml`. The `currentHtml` is injected as a `<current_html>` block in the prompt with the instruction to modify it surgically rather than rewrite from scratch, preventing regressions in the parts that already match. Correction passes use the model configured as `MODELS.sectionCorrection` in `src/config.ts` (currently `claude-haiku-4-5`).
 
 Neighbour context is built with `assembleNeighbour`, which wraps the neighbour's live fragment (from `fragmentMap`, updated after each iteration) inside its shell opening tag. This ensures correction agents see the real rendered HTML of adjacent sections, not the empty shell placeholders from the skeleton.
 
-After each correction pass the skeleton is reassembled with the updated `fragmentMap` and written back to disk. The loop stops early if no sections need fixing or if the aggregate score improvement over the previous iteration falls below 0.01 (plateau detection).
+After each correction pass the skeleton is reassembled with the updated `fragmentMap` and written back to disk. The loop stops early if no sections need fixing or if the aggregate score improvement over the previous iteration falls below 0.01 (plateau detection). When plateau detection fires, the file on disk is the previous iteration's output — the regressed version is never written.
 
 Each iteration writes an `iter-N-report.html` to `corrections/` containing a card per section with its score badge, severity, issue list, and side-by-side screenshots. Source screenshots are saved once to `sections/source-<slug>.png`; generated screenshots are saved to `corrections/iter-N/generated-<slug>.png`.
 
@@ -80,7 +82,7 @@ When `--baseline` is passed, `runBaseline` runs `claude-haiku-4-5` on the raw so
 
 All token consumption is tracked and converted to USD at the end of the run. The formula has three components:
 
-Generation cost uses `claude-sonnet-4-6` pricing ($3/MTok in, $15/MTok out) against the combined skeleton and section (plus correction) token counts. Caption cost uses `claude-haiku-4-5` pricing ($0.8/MTok in, $4/MTok out) against `captionTokensIn/Out` returned by `crawlAndPreprocess`. Scorer cost uses `claude-sonnet-4-6` pricing against `scorerTokensIn/Out`, which accumulates across all `computeSectionDiscrepancies` calls in the correction loop plus the final `collectFidelityMetrics` call.
+Generation cost uses the `MODELS.sectionInitial` pricing against the combined skeleton and section token counts. Correction cost uses `MODELS.sectionCorrection` pricing against correction-pass token counts. Caption cost uses `MODELS.caption` pricing against `captionTokensIn/Out` returned by `crawlAndPreprocess`. Scorer cost uses `MODELS.vlmScorer` pricing against `scorerTokensIn/Out`, which accumulates across all `computeSectionDiscrepancies` calls in the correction loop plus the final `collectFidelityMetrics` call.
 
 Pricing constants and `estimateCost` live in `src/observability/metrics.ts`. The final `estimatedCostUsd` is written to `run.json`.
 
@@ -129,25 +131,29 @@ The `Recorder` class opens a write stream to `run.ndjson` and appends a JSON lin
 | Max screenshot height | 7,800px | `context.ts`, `fidelity.ts` |
 | Section tall threshold (triggers descent) | 1,350px | `context.ts` |
 | Max sections per page | 20 | `context.ts` |
-| VLM batch size (pairs per scorer call) | 5 | `fidelity.ts` |
+| VLM batch size (pairs per scorer call) | 8 | `fidelity.ts` |
 | Section screenshot min height ratio | 25% of source heightPx | `fidelity.ts` |
-| Section agent max tokens | 8,000 | `agent.ts` |
-| Correction threshold (score below triggers fix) | 0.85 | `agent.ts` |
-| Plateau delta (stops loop if improvement ≤) | 0.01 | `agent.ts` |
+| Section agent max tokens | 8,000 | `section-agent.ts` |
+| Correction threshold (score below triggers fix) | 0.70 | `correction-loop.ts` |
+| Plateau delta (stops loop if improvement ≤) | 0.01 | `correction-loop.ts` |
 | VLM resize target | 1024px wide, JPEG 80% | `image.ts` |
+| Model assignments | see `src/config.ts` `MODELS` | `config.ts` |
+| Quality budgets | see `src/config.ts` `QUALITY_BUDGETS` | `config.ts` |
 
 ---
 
 ## Model Assignments
 
-| Role | Model |
-|---|---|
-| Skeleton generation | `claude-sonnet-4-6` |
-| Section generation | `claude-sonnet-4-6` |
-| Section correction | `claude-sonnet-4-6` |
-| VLM fidelity scorer | `claude-sonnet-4-6` |
-| Section captioning | `claude-haiku-4-5` |
-| Baseline generation | `claude-haiku-4-5` |
+All model names are defined in `src/config.ts` under the `MODELS` object. Edit that file to swap models across the entire pipeline — no model strings exist in operational code.
+
+| Role | Config key | Current model |
+|---|---|---|
+| Skeleton generation | `MODELS.skeleton` | `claude-sonnet-4-6` |
+| Section generation (initial) | `MODELS.sectionInitial` | `claude-sonnet-4-6` |
+| Section generation (correction) | `MODELS.sectionCorrection` | `claude-haiku-4-5` |
+| VLM fidelity scorer | `MODELS.vlmScorer` | `claude-sonnet-4-6` |
+| Section captioning | `MODELS.caption` | `claude-haiku-4-5` |
+| Baseline generation | `MODELS.baseline` | `claude-haiku-4-5` |
 
 ---
 
@@ -159,15 +165,15 @@ URL
      ├─ Puppeteer: DOM, screenshots, CSS, assets
      └─ Haiku: parallel VLM captions → VisualArchDoc + CrawlResult
          └─ generatePage()                  agent.ts
-             ├─ Sonnet: skeleton → skeleton.html
-             ├─ Sonnet ×N (parallel): sections → sectionFragments[]
-             ├─ assembleSkeleton() → page.html
-             └─ [correction, fidelity mode]
+             ├─ Sonnet: skeleton → skeleton.html           skeleton-agent.ts
+             ├─ Sonnet ×N (parallel): sections → fragments  section-agent.ts
+             ├─ assembleSkeleton() → page.html              assembly.ts
+             └─ [correction, --quality standard|quality]
                  ├─ Puppeteer: screenshot page.html by slug
-                 ├─ Sonnet: computeSectionDiscrepancies (batch VLM)
-                 ├─ Sonnet ×M (parallel): corrected sections
+                 ├─ Sonnet: computeSectionDiscrepancies (batch VLM, size 8)
+                 ├─ Haiku ×M (parallel): corrected sections   section-agent.ts
                  ├─ assembleSkeleton() → page.html (overwrite)
-                 └─ repeat up to maxSectionIter times
+                 └─ repeat up to maxCorrectionIter; settled sections skipped
              └─ collectFidelityMetrics()   fidelity.ts
                  ├─ Puppeteer: final screenshots
                  └─ Sonnet: final section VLM score

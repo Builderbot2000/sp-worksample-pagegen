@@ -2,15 +2,13 @@
 
 export type Severity = "high" | "medium" | "low";
 
-// ─── Fidelity mode ────────────────────────────────────────────────────────────
+// ─── Quality mode ────────────────────────────────────────────────────────────
 
-export type FidelityMode = "minimal" | "fast" | "balanced" | "high" | "maximal";
+export type QualityMode = "draft" | "standard" | "quality";
 
-export interface FidelityBudget {
-  /** Hard cap for initial generation. null = use estimateMaxTokens() dynamically. */
-  generateMaxTokens: number | null;
+export interface QualityBudget {
   /** Max correction iterations per section. 0 = no correction loop. */
-  maxSectionIter: number;
+  maxCorrectionIter: number;
 }
 
 // ─── Visual architecture ──────────────────────────────────────────────────────
@@ -52,7 +50,7 @@ export interface FetchData {
   fontCount?: number;
   sectionCount?: number;
   resolvedMaxIter?: number;
-  fidelityMode?: FidelityMode;
+  qualityMode?: QualityMode;
 }
 
 export interface GenerateData {

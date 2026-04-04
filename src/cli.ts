@@ -3,9 +3,9 @@ import { Command } from "commander";
 import { execSync } from "child_process";
 import { generatePage } from "./agent";
 import type { GenerateOptions } from "./agent";
-import type { FidelityMode } from "./observability/types";
+import type { QualityMode } from "./observability/types";
 
-const FIDELITY_CHOICES: FidelityMode[] = ["minimal", "fast", "balanced", "high", "maximal"];
+const QUALITY_CHOICES: QualityMode[] = ["draft", "standard", "quality"];
 
 const program = new Command()
   .name("page-gen")
@@ -13,13 +13,13 @@ const program = new Command()
   .argument("<url>", "URL of the source page")
   .option("--name <label>", "Human-readable name for this run")
   .option(
-    "--fidelity <mode>",
-    `Quality/budget mode: ${FIDELITY_CHOICES.join(" | ")} (default: balanced)`,
+    "--quality <mode>",
+    `Quality/budget mode: ${QUALITY_CHOICES.join(" | ")} (default: standard)`,
     (v) => {
-      if (!FIDELITY_CHOICES.includes(v as FidelityMode)) {
-        throw new Error(`--fidelity must be one of: ${FIDELITY_CHOICES.join(", ")}`);
+      if (!QUALITY_CHOICES.includes(v as QualityMode)) {
+        throw new Error(`--quality must be one of: ${QUALITY_CHOICES.join(", ")}`);
       }
-      return v as FidelityMode;
+      return v as QualityMode;
     },
   )
   .option("--baseline", "Also run the baseline agent for comparison")

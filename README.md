@@ -28,23 +28,21 @@ All flags:
 ```sh
 npm run generate -- <url> \
   --name <label>        # human-readable name for the run (used in report title and output directory)
-  --fidelity <mode>     # quality/budget mode: minimal | fast | balanced | high | maximal (default: balanced)
+  --quality <mode>      # quality/budget mode: draft | standard | quality (default: standard)
   --baseline            # also run the baseline agent and produce a side-by-side comparison report
   --correction          # run per-section correction loop after initial generation
   --open                # open the generated file in the default browser
 ```
 
-### Fidelity modes
+### Quality modes
 
-The `--fidelity` flag controls the token budget for the skeleton agent and the maximum number of correction iterations per section (when `--correction` is enabled).
+The `--quality` flag controls the maximum number of correction iterations run per section when `--correction` is enabled. The skeleton always uses a dynamically scaled token budget.
 
-| Mode | Max section correction iters | Initial token budget | Relative cost |
-|---|---|---|---|
-| `minimal` | 0 | 8 000 tokens | ~$0.05 |
-| `fast` | 1 | 12 000 tokens | ~$0.20 |
-| `balanced` | 2 | dynamic | ~$0.50–1.50 |
-| `high` | 3 | dynamic | ~$1.50–4.00 |
-| `maximal` | 4 | dynamic | ~$4.00+ |
+| Mode | Max correction iterations | Relative cost |
+|---|---|---|
+| `draft` | 0 — single-pass generation only | ~$1–2 |
+| `standard` | 2 (default) | ~$2.50–3.50 |
+| `quality` | 3 | ~$3.50–5 |
 
 Output goes to `output/<timestamp>-<name|url-slug>/` and includes `run.ndjson`, `run.json`, `report.html`, and `main/<page>.html`.
 
@@ -55,7 +53,8 @@ To run the canonical reference experiment — experimental pipeline vs. baseline
 ```sh
 npm run generate -- https://stripe.com/en-ca/payments \
   --name stripe-en-ca-payments-reference \
-  --fidelity balanced \
+  --quality standard \
+  --correction \
   --baseline
 ```
 
@@ -107,7 +106,7 @@ npm run test:skeleton -- https://stripe.com/payments --name stripe-skeleton-test
 
 ### Generate test
 
-Runs the crawl + full initial generation (skeleton → parallel section agents → assembly) in isolation (no fidelity loop, no patching). Useful for iterating on the generation prompts without waiting for the full pipeline. Pass `--correction` to also run the per-section correction loop after assembly.
+Runs the crawl + full initial generation (skeleton → parallel section agents → assembly) in isolation (no correction loop, no patching). Useful for iterating on the generation prompts without waiting for the full pipeline. Pass `--correction` to also run the per-section correction loop after assembly.
 
 ```sh
 npm run test:generate -- <url>

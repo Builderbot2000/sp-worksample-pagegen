@@ -9,7 +9,6 @@ import { estimateMaxTokens } from "../observability/metrics";
 import { SKELETON_SYSTEM, buildSkeletonUserContent } from "../prompts/skeleton";
 import { formatArchDoc } from "./assembly";
 import type { CrawlResult } from "../context";
-import type { FidelityBudget } from "../observability/types";
 import { MODELS } from "../config";
 
 const GENERATE_MODEL = MODELS.skeleton;
@@ -26,10 +25,9 @@ export interface SkeletonResult {
 export async function runSkeletonAgent(params: {
   url: string;
   crawlResult: CrawlResult;
-  budget: FidelityBudget;
   mainDir: string;
 }): Promise<SkeletonResult | null> {
-  const { url, crawlResult, budget, mainDir } = params;
+  const { url, crawlResult, mainDir } = params;
   const archDoc = crawlResult.visualArchDoc;
 
   let skeletonHtml: string | null = null;
@@ -67,8 +65,7 @@ export async function runSkeletonAgent(params: {
 
   const runner = client.beta.messages.toolRunner({
     model: GENERATE_MODEL,
-    max_tokens:
-      budget.generateMaxTokens ?? estimateMaxTokens(crawlResult.html.length, GENERATE_MODEL),
+    max_tokens: estimateMaxTokens(crawlResult.html.length, GENERATE_MODEL),
     thinking: { type: "disabled" },
     tools: [saveSkeletonTool],
     tool_choice: { type: "tool", name: "save_file" },

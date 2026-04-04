@@ -6,7 +6,7 @@ import { screenshotSectionsBySlug, computeSectionDiscrepancies, scoreSeverity } 
 import { buildCorrectionIterReport } from "../observability/correction-report";
 import type { CrawlResult } from "../context";
 import type { VisualArchDoc, IterationRecord } from "../observability/types";
-import type { FidelityBudget } from "../observability/types";
+import type { QualityBudget } from "../observability/types";
 import { MODELS } from "../config";
 
 const CORRECTION_THRESHOLD = 0.70;
@@ -18,7 +18,7 @@ export interface CorrectionLoopParams {
   skeleton: string;
   archDoc: VisualArchDoc;
   crawlResult: CrawlResult;
-  budget: FidelityBudget;
+  budget: QualityBudget;
   runDir: string;
   sectionFragments: { slug: string; fragment: string }[];
 }
@@ -60,7 +60,7 @@ export async function runCorrectionLoop(
     if (bufs?.[0]) fs.writeFileSync(path.join(sectionsDir, `source-${section.slug}.png`), bufs[0]);
   }
 
-  for (let iter = 1; iter <= budget.maxSectionIter; iter++) {
+  for (let iter = 1; iter <= budget.maxCorrectionIter; iter++) {
     const genScreenshots = await screenshotSectionsBySlug({ file: assembledPath }, archDoc);
 
     // Build filtered views that exclude sections already settled in a prior iteration.
@@ -104,7 +104,7 @@ export async function runCorrectionLoop(
     }
 
     console.log(
-      `[correct] iter ${iter}/${budget.maxSectionIter} — score ${result.aggregateScore.toFixed(2)}, ` +
+      `[correct] iter ${iter}/${budget.maxCorrectionIter} — score ${result.aggregateScore.toFixed(2)}, ` +
       `fixing ${sectionsToFix.length} sections: [${[...slugsToFix].join(", ")}]`,
     );
 
@@ -113,7 +113,7 @@ export async function runCorrectionLoop(
       iterReportPath,
       buildCorrectionIterReport({
         iter,
-        maxIter: budget.maxSectionIter,
+        maxIter: budget.maxCorrectionIter,
         url,
         aggregateScore: result.aggregateScore,
         matched: result.matched,
