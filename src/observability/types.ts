@@ -39,21 +39,54 @@ export interface SectionDiscrepancy {
   score?: number;
 }
 
+// ─── VLM verdict + section score entry ───────────────────────────────────────
+
+export type VlmVerdict = "close" | "partial" | "distant";
+
+export interface SectionScoreEntry {
+  score: number;
+  verdict: VlmVerdict;
+  issues: string[];
+}
+
 // ─── Phase data interfaces ────────────────────────────────────────────────────
 
-export interface FetchData {
+export interface RunStartData {
+  runId: string;
+  url: string;
+  qualityMode: QualityMode;
+  correctionEnabled: boolean;
+  baselineEnabled: boolean;
+}
+
+export interface RunCompleteData {
+  runId: string;
+  durationMs: number;
+  estimatedCostUsd: number;
+  outputFile: string | null;
+}
+
+export interface PreprocessStartData {
+  url: string;
+}
+
+export interface PreprocessCompleteData {
   url: string;
   htmlBytes: number;
   truncated: boolean;
-  enriched?: boolean;
-  imageCount?: number;
-  fontCount?: number;
-  sectionCount?: number;
-  resolvedMaxIter?: number;
-  qualityMode?: QualityMode;
+  sectionCount: number;
+  imageCount: number;
+  fontCount: number;
+  captionTokensIn: number;
+  captionTokensOut: number;
+  durationMs: number;
 }
 
-export interface GenerateData {
+export interface SkeletonStartData {
+  model: string;
+}
+
+export interface SkeletonCompleteData {
   model: string;
   tokensIn: number;
   tokensOut: number;
@@ -61,37 +94,116 @@ export interface GenerateData {
   outputFile: string;
 }
 
-export interface ScreenshotData {
-  target: string;
-  imageBytes: number;
-  durationMs: number;
+export interface SectionStartData {
+  slug: string;
+  role: string;
+  order: number;
+  model: string;
 }
 
-export interface DiffData {
-  iteration: number;
-  vlmScore: number;
-  matched: number;
-  unmatched: number;
-  discrepancyCount: number;
-}
-
-export interface FixData {
-  iteration: number;
+export interface SectionCompleteData {
+  slug: string;
+  role: string;
+  order: number;
   model: string;
   tokensIn: number;
   tokensOut: number;
   durationMs: number;
-  htmlSizeDelta: number;
+}
+
+export interface AssembleStartData {
+  sectionCount: number;
+}
+
+export interface AssembleCompleteData {
+  outputFile: string;
+  htmlSizeBytes: number;
+  durationMs: number;
+}
+
+export interface CorrectionIterStartData {
+  iteration: number;
+  activeSlugs: string[];
+}
+
+export interface CorrectionIterCompleteData {
+  iteration: number;
+  aggregateScore: number;
+  sectionsToFix: number;
+  durationMs: number;
+}
+
+export interface SectionScoreData {
+  iteration: number;
+  slug: string;
+  score: number;
+  verdict: VlmVerdict;
+  issues: string[];
+  generatedScreenshotPath?: string;
+  sourceScreenshotPath?: string;
+}
+
+export interface SectionCorrectionStartData {
+  iteration: number;
+  slug: string;
+  prevScore: number;
+  model: string;
+}
+
+export interface SectionCorrectionCompleteData {
+  iteration: number;
+  slug: string;
+  tokensIn: number;
+  tokensOut: number;
+  durationMs: number;
+}
+
+export interface FidelityStartData {
+  // intentionally empty
+}
+
+export interface FidelityCompleteData {
+  mainScore: number;
+  baselineScore?: number;
+  tokensIn: number;
+  tokensOut: number;
+  durationMs: number;
+}
+
+export interface BaselineStartData {
+  model: string;
+}
+
+export interface BaselineCompleteData {
+  model: string;
+  tokensIn: number;
+  tokensOut: number;
+  durationMs: number;
+  outputFile: string;
 }
 
 // ─── LogLine discriminated union ──────────────────────────────────────────────
 
 export type LogLine =
-  | { phase: "fetch"; timestamp: number; data: FetchData }
-  | { phase: "generate"; timestamp: number; data: GenerateData }
-  | { phase: "screenshot"; timestamp: number; data: ScreenshotData }
-  | { phase: "diff"; timestamp: number; data: DiffData }
-  | { phase: "fix"; timestamp: number; data: FixData };
+  | { phase: "run:start"; timestamp: number; data: RunStartData }
+  | { phase: "run:complete"; timestamp: number; data: RunCompleteData }
+  | { phase: "preprocess:start"; timestamp: number; data: PreprocessStartData }
+  | { phase: "preprocess:complete"; timestamp: number; data: PreprocessCompleteData }
+  | { phase: "skeleton:start"; timestamp: number; data: SkeletonStartData }
+  | { phase: "skeleton:complete"; timestamp: number; data: SkeletonCompleteData }
+  | { phase: "section:start"; timestamp: number; data: SectionStartData }
+  | { phase: "section:complete"; timestamp: number; data: SectionCompleteData }
+  | { phase: "assemble:start"; timestamp: number; data: AssembleStartData }
+  | { phase: "assemble:complete"; timestamp: number; data: AssembleCompleteData }
+  | { phase: "correction-iter:start"; timestamp: number; data: CorrectionIterStartData }
+  | { phase: "correction-iter:complete"; timestamp: number; data: CorrectionIterCompleteData }
+  | { phase: "section-score"; timestamp: number; data: SectionScoreData }
+  | { phase: "section-correction:start"; timestamp: number; data: SectionCorrectionStartData }
+  | { phase: "section-correction:complete"; timestamp: number; data: SectionCorrectionCompleteData }
+  | { phase: "fidelity:start"; timestamp: number; data: FidelityStartData }
+  | { phase: "fidelity:complete"; timestamp: number; data: FidelityCompleteData }
+  | { phase: "baseline:start"; timestamp: number; data: BaselineStartData }
+  | { phase: "baseline:complete"; timestamp: number; data: BaselineCompleteData };
 
 // ─── Run records ─────────────────────────────────────────────────────────────
 
@@ -102,6 +214,7 @@ export interface IterationRecord {
   vlmScore: number;
   severity: Severity;
   discrepancyCount: number;
+  sectionScores: Record<string, SectionScoreEntry>;
 }
 
 export interface BaselineComparison {
@@ -116,8 +229,6 @@ export interface BaselineComparison {
 }
 
 // ─── Fidelity metrics ────────────────────────────────────────────────────────
-
-export type VlmVerdict = "close" | "partial" | "distant";
 
 export interface VlmFidelityScore {
   verdict: VlmVerdict;
@@ -134,6 +245,17 @@ export interface FidelityMetrics {
   baselineVlmScore?: VlmFidelityScore;
 }
 
+// ─── Screenshot paths (disk paths relative to runDir) ────────────────────────
+
+export interface ScreenshotPaths {
+  source: string;
+  sections: Record<string, string>;
+  fidelityMain?: string;
+  fidelityBaseline?: string;
+  /** Per-section crops of the generated page fed to the VLM scorer. */
+  fidelitySections?: Record<string, string>;
+}
+
 // ─── Run record ───────────────────────────────────────────────────────────────
 
 export interface RunRecord {
@@ -144,6 +266,7 @@ export interface RunRecord {
   completedAt: number;
   iterations: IterationRecord[];
   estimatedCostUsd: number;
+  screenshotPaths?: ScreenshotPaths;
   baseline?: BaselineComparison;
   fidelityMetrics?: FidelityMetrics;
 }

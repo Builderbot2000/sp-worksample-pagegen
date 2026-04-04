@@ -1,5 +1,6 @@
 import puppeteer from "puppeteer";
 import Anthropic from "@anthropic-ai/sdk";
+import * as fs from "fs";
 import * as path from "path";
 import { resizeForVlm } from "../image";
 import { MODELS } from "../config";
@@ -9,6 +10,7 @@ import type {
   FidelityMetrics,
   VisualArchDoc,
   SectionDiscrepancy,
+  SectionScoreEntry,
 } from "./types";
 
 
@@ -104,6 +106,8 @@ export interface SectionComparisonResult {
   aggregateScore: number;
   tokensIn: number;
   tokensOut: number;
+  /** Full score entry for every section in archDoc (missing sections score 0 / "distant"). */
+  sectionScores: Record<string, SectionScoreEntry>;
 }
 
 // ─── Compute section discrepancies ───────────────────────────────────────────
@@ -117,12 +121,12 @@ export async function computeSectionDiscrepancies(
   const discrepancies: SectionDiscrepancy[] = [];
   const matchedSlugs: string[] = [];
   const unmatchedSlugs: string[] = [];
-  const sectionScores: Record<string, number> = {};
+  const sectionScores: Record<string, SectionScoreEntry> = {};
 
   for (const spec of archDoc.sections) {
     if (!genSections[spec.slug]) {
       unmatchedSlugs.push(spec.slug);
-      sectionScores[spec.slug] = 0;
+      sectionScores[spec.slug] = { score: 0, verdict: "distant", issues: [`Section "${spec.slug}" (${spec.role}) is absent in the reconstruction`] };
       discrepancies.push({
         slug: spec.slug,
         type: "missing",
@@ -199,7 +203,7 @@ export async function computeSectionDiscrepancies(
       if (result.text === null) {
         for (const slug of result.batch) {
           if (sectionScores[slug] === undefined) {
-            sectionScores[slug] = 0;
+            sectionScores[slug] = { score: 0, verdict: "distant", issues: ["VLM scoring failed for this section"] };
             discrepancies.push({
               slug,
               type: "visual",
@@ -229,7 +233,7 @@ export async function computeSectionDiscrepancies(
             const issues = Array.isArray(item.issues)
               ? (item.issues as unknown[]).filter((s): s is string => typeof s === "string").slice(0, 3)
               : [];
-            sectionScores[slug] = score;
+            sectionScores[slug] = { score, verdict, issues };
             if (verdict !== "close") {
               discrepancies.push({
                 slug,
@@ -245,7 +249,7 @@ export async function computeSectionDiscrepancies(
         // JSON parse failed — mark the whole batch as failed
         for (const slug of result.batch) {
           if (sectionScores[slug] === undefined) {
-            sectionScores[slug] = 0;
+            sectionScores[slug] = { score: 0, verdict: "distant", issues: ["VLM scoring failed for this section"] };
             discrepancies.push({
               slug,
               type: "visual",
@@ -262,7 +266,7 @@ export async function computeSectionDiscrepancies(
   const totalSections = archDoc.sections.length;
   const aggregateScore =
     totalSections > 0
-      ? archDoc.sections.reduce((sum, s) => sum + (sectionScores[s.slug] ?? 1), 0) / totalSections
+      ? archDoc.sections.reduce((sum, s) => sum + (sectionScores[s.slug]?.score ?? 1), 0) / totalSections
       : 1;
 
   return {
@@ -272,6 +276,7 @@ export async function computeSectionDiscrepancies(
     aggregateScore,
     tokensIn,
     tokensOut,
+    sectionScores,
   };
 }
 
@@ -319,7 +324,8 @@ export async function collectFidelityMetrics(
   archDoc: VisualArchDoc,
   mainFilePath: string,
   baselineFilePath?: string,
-): Promise<{ metrics: FidelityMetrics; tokensIn: number; tokensOut: number }> {
+  fidelityDir?: string,
+): Promise<{ metrics: FidelityMetrics; tokensIn: number; tokensOut: number; mainSectionPaths: Record<string, string> }> {
   console.log("[fidelity] Computing final fidelity metrics...");
   const start = Date.now();
 
@@ -327,6 +333,19 @@ export async function collectFidelityMetrics(
     screenshotSectionsBySlug({ file: mainFilePath }, archDoc),
     screenshotFile(mainFilePath),
   ]);
+
+  const mainSectionPaths: Record<string, string> = {};
+  if (fidelityDir) {
+    const secDir = path.join(fidelityDir, "sections");
+    fs.mkdirSync(secDir, { recursive: true });
+    for (const [slug, bufs] of Object.entries(mainSections)) {
+      if (bufs[0]) {
+        const fileName = `main-${slug}.png`;
+        fs.writeFileSync(path.join(secDir, fileName), bufs[0]);
+        mainSectionPaths[slug] = `fidelity/sections/${fileName}`;
+      }
+    }
+  }
 
   const mainResult = await computeSectionDiscrepancies(
     sourceMeta.sectionScreenshots,
@@ -346,7 +365,7 @@ export async function collectFidelityMetrics(
   }
 
   console.log(`[fidelity] Done in ${((Date.now() - start) / 1000).toFixed(1)}s`);
-  return { metrics, tokensIn: mainResult.tokensIn, tokensOut: mainResult.tokensOut };
+  return { metrics, tokensIn: mainResult.tokensIn, tokensOut: mainResult.tokensOut, mainSectionPaths };
 }
 
 // ─── Build VlmFidelityScore from section comparison ──────────────────────────

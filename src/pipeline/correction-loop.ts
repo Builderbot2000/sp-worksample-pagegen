@@ -4,6 +4,7 @@ import { assembleSkeleton, extractShellTag, extractRootCssVars, assembleNeighbou
 import { generateSection } from "./section-agent";
 import { screenshotSectionsBySlug, computeSectionDiscrepancies, scoreSeverity } from "../observability/fidelity";
 import { buildCorrectionIterReport } from "../observability/correction-report";
+import { Logger } from "../observability/logger";
 import type { CrawlResult } from "../context";
 import type { VisualArchDoc, IterationRecord } from "../observability/types";
 import type { QualityBudget } from "../observability/types";
@@ -21,6 +22,7 @@ export interface CorrectionLoopParams {
   budget: QualityBudget;
   runDir: string;
   sectionFragments: { slug: string; fragment: string }[];
+  logger: Logger;
 }
 
 export interface CorrectionLoopResult {
@@ -35,7 +37,7 @@ export interface CorrectionLoopResult {
 export async function runCorrectionLoop(
   params: CorrectionLoopParams,
 ): Promise<CorrectionLoopResult> {
-  const { url, assembledPath, skeleton, archDoc, crawlResult, budget, runDir, sectionFragments } = params;
+  const { url, assembledPath, skeleton, archDoc, crawlResult, budget, runDir, sectionFragments, logger } = params;
 
   const fragmentMap = new Map(sectionFragments.map((f) => [f.slug, f.fragment]));
   const rootCssVars = extractRootCssVars(skeleton);
@@ -53,14 +55,19 @@ export async function runCorrectionLoop(
   const correctionsDir = path.join(runDir, "corrections");
   const sectionsDir = path.join(runDir, "sections");
 
-  // Save source screenshots once so per-iteration HTML reports can reference them
-  fs.mkdirSync(sectionsDir, { recursive: true });
-  for (const section of archDoc.sections) {
-    const bufs = crawlResult.sourceSectionScreenshots[section.slug];
-    if (bufs?.[0]) fs.writeFileSync(path.join(sectionsDir, `source-${section.slug}.png`), bufs[0]);
-  }
-
   for (let iter = 1; iter <= budget.maxCorrectionIter; iter++) {
+    const iterStart = Date.now();
+
+    // Active sections = all sections not yet settled in prior iterations
+    const preScoringActiveSlugs = archDoc.sections
+      .filter((s) => !settledSlugs.has(s.slug))
+      .map((s) => s.slug);
+    logger.log({
+      phase: "correction-iter:start",
+      timestamp: iterStart,
+      data: { iteration: iter, activeSlugs: preScoringActiveSlugs },
+    });
+
     const genScreenshots = await screenshotSectionsBySlug({ file: assembledPath }, archDoc);
 
     // Build filtered views that exclude sections already settled in a prior iteration.
@@ -89,6 +96,27 @@ export async function runCorrectionLoop(
     );
     scorerTokensIn += result.tokensIn;
     scorerTokensOut += result.tokensOut;
+
+    // Emit a section-score event for every active section
+    for (const spec of activeArchDoc.sections) {
+      const entry = result.sectionScores[spec.slug];
+      if (!entry) continue;
+      const genPath = `corrections/iter-${iter}/generated-${spec.slug}.png`;
+      const srcPath = `sections/source-${spec.slug}.png`;
+      logger.log({
+        phase: "section-score",
+        timestamp: Date.now(),
+        data: {
+          iteration: iter,
+          slug: spec.slug,
+          score: entry.score,
+          verdict: entry.verdict,
+          issues: entry.issues,
+          generatedScreenshotPath: genPath,
+          sourceScreenshotPath: srcPath,
+        },
+      });
+    }
 
     const sectionsToFix = result.discrepancies.filter((d) => (d.score ?? 0) < CORRECTION_THRESHOLD);
     const slugsToFix = new Set(sectionsToFix.map((d) => d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim()));
@@ -134,17 +162,30 @@ export async function runCorrectionLoop(
       vlmScore: result.aggregateScore,
       severity: scoreSeverity(result.aggregateScore),
       discrepancyCount: result.discrepancies.length,
+      sectionScores: result.sectionScores,
     });
 
-    if (sectionsToFix.length === 0) break;
+    if (sectionsToFix.length === 0) {
+      logger.log({
+        phase: "correction-iter:complete",
+        timestamp: Date.now(),
+        data: { iteration: iter, aggregateScore: result.aggregateScore, sectionsToFix: 0, durationMs: Date.now() - iterStart },
+      });
+      break;
+    }
     if (iter > 1 && result.aggregateScore - prevScore < PLATEAU_DELTA) {
       console.log(`[correct] Plateau detected — stopping.`);
+      logger.log({
+        phase: "correction-iter:complete",
+        timestamp: Date.now(),
+        data: { iteration: iter, aggregateScore: result.aggregateScore, sectionsToFix: sectionsToFix.length, durationMs: Date.now() - iterStart },
+      });
       break;
     }
     prevScore = result.aggregateScore;
 
     const correctionResults = await Promise.all(
-      sectionsToFix.map((d) => {
+      sectionsToFix.map(async (d) => {
         const baseSlug = d.slug.replace(/\s*\([^)]*\)\s*$/, "").trim();
         const section = archDoc.sections.find((s) => s.slug === baseSlug);
         if (!section) return Promise.resolve({ slug: baseSlug, fragment: "", tokensIn: 0, tokensOut: 0 });
@@ -161,7 +202,14 @@ export async function runCorrectionLoop(
           ? assembleNeighbour(nextShell, fragmentMap.get(nextSlug!) ?? "")
           : undefined;
         const shellCtx = selfTag ? { self: selfTag, prev: prevTag, next: nextTag } : undefined;
-        return generateSection(
+        const corrStart = Date.now();
+        const prevScore = result.sectionScores[baseSlug]?.score ?? 0;
+        logger.log({
+          phase: "section-correction:start",
+          timestamp: corrStart,
+          data: { iteration: iter, slug: baseSlug, prevScore, model: MODELS.sectionCorrection },
+        });
+        const r = await generateSection(
           section,
           { prev: archDoc.sections[i - 1]?.slug, next: archDoc.sections[i + 1]?.slug },
           crawlResult.sourceSectionScreenshots[section.slug] ?? [],
@@ -176,6 +224,12 @@ export async function runCorrectionLoop(
           fragmentMap.get(baseSlug),
           MODELS.sectionCorrection,
         );
+        logger.log({
+          phase: "section-correction:complete",
+          timestamp: Date.now(),
+          data: { iteration: iter, slug: r.slug, tokensIn: r.tokensIn, tokensOut: r.tokensOut, durationMs: Date.now() - corrStart },
+        });
+        return r;
       }),
     );
 
@@ -190,6 +244,12 @@ export async function runCorrectionLoop(
       [...fragmentMap].map(([slug, fragment]) => ({ slug, fragment })),
     );
     fs.writeFileSync(assembledPath, reassembled, "utf-8");
+
+    logger.log({
+      phase: "correction-iter:complete",
+      timestamp: Date.now(),
+      data: { iteration: iter, aggregateScore: result.aggregateScore, sectionsToFix: sectionsToFix.length, durationMs: Date.now() - iterStart },
+    });
   }
 
   return { fragmentMap, scorerTokensIn, scorerTokensOut, sectionTokensIn, sectionTokensOut, iterationRecords };

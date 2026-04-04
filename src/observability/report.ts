@@ -42,6 +42,15 @@ function buildIterationRows(record: RunRecord): string {
       const color = severityColor(iter.severity);
       const barWidth = scoreBarWidth(iter.vlmScore);
       const matchedColor = iter.unmatched === 0 ? "#22c55e" : "#f59e0b";
+
+      const sectionBadges = iter.sectionScores && Object.keys(iter.sectionScores).length > 0
+        ? `\n      <tr>\n        <td colspan="6" style="padding:0.25rem 1rem 0.75rem">\n          <div style="display:flex;flex-wrap:wrap;gap:0.3rem">\n            ${Object.entries(iter.sectionScores)
+                .map(([slug, entry]) => {
+                  const sc = scoreColor(entry.score);
+                  return `<span title="${entry.issues.join("; ") || "no issues"}" style="display:inline-block;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.7rem;font-weight:600;background:${sc}22;color:${sc};border:1px solid ${sc}44">${escapeHtml(slug)} ${entry.score.toFixed(2)}</span>`;
+                }).join("")}\n          </div>\n        </td>\n      </tr>`
+        : "";
+
       return `
       <tr>
         <td style="padding:0.6rem 1rem;text-align:center;font-variant-numeric:tabular-nums">${iter.iteration}</td>
@@ -57,7 +66,7 @@ function buildIterationRows(record: RunRecord): string {
         </td>
         <td style="padding:0.6rem 1rem;color:${color};font-weight:600;font-size:0.875rem">${iter.severity}</td>
         <td style="padding:0.6rem 1rem;text-align:center;font-size:0.875rem;color:#9ca3af">${iter.discrepancyCount}</td>
-      </tr>`;
+      </tr>${sectionBadges}`;
     })
     .join("\n");
 }

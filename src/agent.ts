@@ -7,7 +7,7 @@ import { Logger } from "./observability/logger";
 import { estimateCost } from "./observability/metrics";
 import { collectFidelityMetrics } from "./observability/fidelity";
 import { generateReport } from "./observability/report";
-import type { RunRecord, QualityMode, QualityBudget } from "./observability/types";
+import type { RunRecord, QualityMode, QualityBudget, ScreenshotPaths } from "./observability/types";
 export type { QualityBudget };
 import { formatArchDoc, assembleSkeleton, extractRootCssVars, extractShellTag, assembleNeighbour } from "./pipeline/assembly";
 export { formatArchDoc, assembleSkeleton, extractShellTag, assembleNeighbour };
@@ -44,24 +44,48 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
 
   let savedPath: string | null = null;
 
+  logger.log({
+    phase: "run:start",
+    timestamp: Date.now(),
+    data: {
+      runId,
+      url,
+      qualityMode: opts.quality ?? "standard",
+      correctionEnabled: opts.correction ?? false,
+      baselineEnabled: opts.baseline ?? false,
+    },
+  });
+
+  logger.log({ phase: "preprocess:start", timestamp: Date.now(), data: { url } });
+  const preprocessStart = Date.now();
   const crawlResult = await crawlAndPreprocess(url);
   const archDoc = crawlResult.visualArchDoc;
   const budget = QUALITY_BUDGETS[opts.quality ?? "standard"];
 
   logger.log({
-    phase: "fetch",
+    phase: "preprocess:complete",
     timestamp: Date.now(),
     data: {
       url,
       htmlBytes: crawlResult.html.length,
       truncated: crawlResult.truncated,
-      enriched: true,
+      sectionCount: archDoc.sections.length,
       imageCount: crawlResult.imageUrls.length,
       fontCount: crawlResult.fontFamilies.length,
-      sectionCount: archDoc.sections.length,
-      qualityMode: opts.quality ?? "standard",
+      captionTokensIn: crawlResult.captionTokensIn,
+      captionTokensOut: crawlResult.captionTokensOut,
+      durationMs: Date.now() - preprocessStart,
     },
   });
+
+  // ── Phase 0: Save source screenshots unconditionally ─────────────────────────
+  const sectionsDir = path.join(runDir, "sections");
+  fs.mkdirSync(sectionsDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "source.png"), Buffer.from(crawlResult.screenshotBase64, "base64"));
+  for (const section of archDoc.sections) {
+    const bufs = crawlResult.sourceSectionScreenshots[section.slug];
+    if (bufs?.[0]) fs.writeFileSync(path.join(sectionsDir, `source-${section.slug}.png`), bufs[0]);
+  }
 
   const record: RunRecord = {
     runId,
@@ -71,6 +95,14 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     completedAt: 0,
     iterations: [],
     estimatedCostUsd: 0,
+    screenshotPaths: {
+      source: "source.png",
+      sections: Object.fromEntries(
+        archDoc.sections
+          .filter((s) => crawlResult.sourceSectionScreenshots[s.slug]?.[0])
+          .map((s) => [s.slug, `sections/source-${s.slug}.png`]),
+      ),
+    },
   };
 
   const generateStart = Date.now();
@@ -80,12 +112,19 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
   // ── Stage 1: Skeleton Agent ──────────────────────────────────────────────────────
   console.log(`
 [gen] Stage 1 — skeleton (${GENERATE_MODEL})...`);
+  const skeletonStart = Date.now();
+  logger.log({ phase: "skeleton:start", timestamp: skeletonStart, data: { model: MODELS.skeleton } });
   const skeletonResult = await runSkeletonAgent({ url, crawlResult, mainDir });
   if (!skeletonResult) {
     console.error("[gen] Skeleton agent produced no output — aborting.");
     return null;
   }
   const { skeletonHtml, skeletonBasename, tokensIn: skeletonIn, tokensOut: skeletonOut } = skeletonResult;
+  logger.log({
+    phase: "skeleton:complete",
+    timestamp: Date.now(),
+    data: { model: MODELS.skeleton, tokensIn: skeletonIn, tokensOut: skeletonOut, durationMs: Date.now() - skeletonStart, outputFile: `main/${skeletonBasename}-skeleton.html` },
+  });
   console.log(`[gen] Skeleton done — ${skeletonIn} in / ${skeletonOut} out tokens`);
 
   // ── Stage 2: Section Agents (parallel) ──────────────────────────────────────
@@ -93,12 +132,18 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
 [gen] Stage 2 — ${archDoc.sections.length} section agents (parallel)...`);
   const rootCssVars = extractRootCssVars(skeletonHtml);
   const sectionResults = await Promise.all(
-    archDoc.sections.map((section, i) => {
+    archDoc.sections.map(async (section, i) => {
       const selfTag = extractShellTag(skeletonHtml, section.slug);
       const prevTag = i > 0 ? extractShellTag(skeletonHtml, archDoc.sections[i - 1].slug) : undefined;
       const nextTag = i < archDoc.sections.length - 1 ? extractShellTag(skeletonHtml, archDoc.sections[i + 1].slug) : undefined;
       const shellContext = selfTag ? { self: selfTag, prev: prevTag, next: nextTag } : undefined;
-      return generateSection(
+      const sectionStart = Date.now();
+      logger.log({
+        phase: "section:start",
+        timestamp: sectionStart,
+        data: { slug: section.slug, role: section.role, order: section.order, model: MODELS.sectionInitial },
+      });
+      const result = await generateSection(
         section,
         { prev: archDoc.sections[i - 1]?.slug, next: archDoc.sections[i + 1]?.slug },
         crawlResult.sourceSectionScreenshots[section.slug] ?? [],
@@ -109,6 +154,12 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
         rootCssVars || undefined,
         shellContext,
       );
+      logger.log({
+        phase: "section:complete",
+        timestamp: Date.now(),
+        data: { slug: result.slug, role: section.role, order: section.order, model: MODELS.sectionInitial, tokensIn: result.tokensIn, tokensOut: result.tokensOut, durationMs: Date.now() - sectionStart },
+      });
+      return result;
     }),
   );
 
@@ -120,11 +171,18 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
   // ── Stage 3: Programmatic Assembly ─────────────────────────────────────────────
   console.log(`
 [gen] Stage 3 — assembling...`);
+  const assembleStart = Date.now();
+  logger.log({ phase: "assemble:start", timestamp: assembleStart, data: { sectionCount: sectionFragments.length } });
   const assembledHtml = assembleSkeleton(skeletonHtml, sectionFragments);
   const assembledFilename = `${skeletonBasename}.html`;
   const assembledPath = path.join(mainDir, assembledFilename);
   fs.writeFileSync(assembledPath, assembledHtml, "utf-8");
   savedPath = assembledPath;
+  logger.log({
+    phase: "assemble:complete",
+    timestamp: Date.now(),
+    data: { outputFile: `main/${assembledFilename}`, htmlSizeBytes: Buffer.byteLength(assembledHtml, "utf-8"), durationMs: Date.now() - assembleStart },
+  });
   console.log(`[gen] Assembled — ${assembledPath}`);
 
   let correctionSectionTokensIn = 0;
@@ -141,6 +199,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
       budget,
       runDir,
       sectionFragments,
+      logger,
     });
     scorerTokensIn += loopResult.scorerTokensIn;
     scorerTokensOut += loopResult.scorerTokensOut;
@@ -148,17 +207,6 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     correctionSectionTokensOut = loopResult.sectionTokensOut;
     for (const iterRecord of loopResult.iterationRecords) {
       record.iterations.push(iterRecord);
-      logger.log({
-        phase: "diff",
-        timestamp: Date.now(),
-        data: {
-          iteration: iterRecord.iteration,
-          vlmScore: iterRecord.vlmScore,
-          matched: iterRecord.matched,
-          unmatched: iterRecord.unmatched,
-          discrepancyCount: iterRecord.discrepancyCount,
-        },
-      });
     }
   }
 
@@ -166,30 +214,17 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
   const generateTokensIn = skeletonIn + sectionTokensIn + correctionSectionTokensIn;
   const generateTokensOut = skeletonOut + sectionTokensOut + correctionSectionTokensOut;
 
-  logger.log({
-    phase: "generate",
-    timestamp: Date.now(),
-    data: {
-      model: GENERATE_MODEL,
-      tokensIn: generateTokensIn,
-      tokensOut: generateTokensOut,
-      durationMs: generateDurationMs,
-      outputFile: savedPath ?? "",
-    },
-  });
-
-  record.completedAt = Date.now();
-  record.estimatedCostUsd =
-    estimateCost(GENERATE_MODEL, generateTokensIn, generateTokensOut) +
-    estimateCost(MODELS.caption, crawlResult.captionTokensIn, crawlResult.captionTokensOut) +
-    estimateCost(GENERATE_MODEL, scorerTokensIn, scorerTokensOut);
-
   let baselineSavedPath: string | null = null;
   if (opts.baseline) {
     const baselineDir = path.join(runDir, "baseline");
-    console.log("\n[baseline] Running baseline agent...");
+    logger.log({ phase: "baseline:start", timestamp: Date.now(), data: { model: BASELINE_MODEL } });
     const bl = await runBaseline(url, baselineDir, crawlResult.html);
     baselineSavedPath = bl.savedPath;
+    logger.log({
+      phase: "baseline:complete",
+      timestamp: Date.now(),
+      data: { model: BASELINE_MODEL, tokensIn: bl.tokensIn, tokensOut: bl.tokensOut, durationMs: bl.durationMs, outputFile: `baseline/${path.basename(bl.savedPath ?? "")}` },
+    });
     record.baseline = {
       baselineScore: 0,
       baselineCostUsd: estimateCost(BASELINE_MODEL, bl.tokensIn, bl.tokensOut),
@@ -200,21 +235,50 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
       mainDurationMs: generateDurationMs,
       mainThumbnail: "",
     };
-    console.log(`[baseline] Saved to ${bl.savedPath}`);
   }
 
   if (savedPath) {
-    console.log("\n[fidelity] Computing final fidelity metrics...");
+    const fidelityStart = Date.now();
+    logger.log({ phase: "fidelity:start", timestamp: fidelityStart, data: {} });
     try {
-      const { metrics: fidelity, tokensIn: fidelityIn, tokensOut: fidelityOut } = await collectFidelityMetrics(
+      const fidelityDir = path.join(runDir, "fidelity");
+      const { metrics: fidelity, tokensIn: fidelityIn, tokensOut: fidelityOut, mainSectionPaths } = await collectFidelityMetrics(
         { screenshotBase64: crawlResult.screenshotBase64, sectionScreenshots: crawlResult.sourceSectionScreenshots },
         archDoc,
         savedPath,
         baselineSavedPath ?? undefined,
+        fidelityDir,
       );
       scorerTokensIn += fidelityIn;
       scorerTokensOut += fidelityOut;
       record.fidelityMetrics = fidelity;
+
+      // Save fidelity screenshots to disk for log-based reconstruction
+      fs.mkdirSync(fidelityDir, { recursive: true });
+      fs.writeFileSync(path.join(fidelityDir, "main.png"), Buffer.from(fidelity.mainScreenshotBase64, "base64"));
+      if (record.screenshotPaths) {
+        record.screenshotPaths.fidelityMain = "fidelity/main.png";
+        if (Object.keys(mainSectionPaths).length > 0) {
+          record.screenshotPaths.fidelitySections = mainSectionPaths;
+        }
+      }
+      if (fidelity.baselineScreenshotBase64) {
+        fs.writeFileSync(path.join(fidelityDir, "baseline.png"), Buffer.from(fidelity.baselineScreenshotBase64, "base64"));
+        if (record.screenshotPaths) record.screenshotPaths.fidelityBaseline = "fidelity/baseline.png";
+      }
+
+      logger.log({
+        phase: "fidelity:complete",
+        timestamp: Date.now(),
+        data: {
+          mainScore: fidelity.mainVlmScore.score,
+          ...(fidelity.baselineScreenshotBase64 ? { baselineScore: record.baseline?.baselineScore } : {}),
+          tokensIn: fidelityIn,
+          tokensOut: fidelityOut,
+          durationMs: Date.now() - fidelityStart,
+        },
+      });
+
       if (record.baseline) {
         record.baseline.mainScore = fidelity.mainVlmScore.score;
         record.baseline.mainThumbnail = fidelity.mainScreenshotBase64;
@@ -227,6 +291,17 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     }
   }
 
+  record.completedAt = Date.now();
+  record.estimatedCostUsd =
+    estimateCost(GENERATE_MODEL, generateTokensIn, generateTokensOut) +
+    estimateCost(MODELS.caption, crawlResult.captionTokensIn, crawlResult.captionTokensOut) +
+    estimateCost(MODELS.vlmScorer, scorerTokensIn, scorerTokensOut);
+
+  logger.log({
+    phase: "run:complete",
+    timestamp: Date.now(),
+    data: { runId, durationMs: record.completedAt - record.startedAt, estimatedCostUsd: record.estimatedCostUsd, outputFile: savedPath },
+  });
   logger.finalize(record);
   generateReport(runDir, record, record.fidelityMetrics?.sourceScreenshotBase64);
   return savedPath;
