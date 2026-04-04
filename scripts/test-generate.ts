@@ -45,6 +45,8 @@ import { z } from "zod";
 
 // ── Parse args ────────────────────────────────────────────────────────────────
 
+const QUALITY_ITER: Record<string, number> = { draft: 0, standard: 2, quality: 3 };
+
 const args = process.argv.slice(2);
 const urlArg = args.find((a) => !a.startsWith("--"));
 const outIndex = args.indexOf("--out");
@@ -52,9 +54,12 @@ const outArg = outIndex !== -1 ? args[outIndex + 1] : undefined;
 const nameIndex = args.indexOf("--name");
 const nameArg = nameIndex !== -1 ? args[nameIndex + 1] : undefined;
 const correctionArg = args.includes("--correction");
+const qualityIndex = args.indexOf("--quality");
+const qualityArg = qualityIndex !== -1 ? args[qualityIndex + 1] : "standard";
+const correctionMaxIter = QUALITY_ITER[qualityArg] ?? 2;
 
 if (!urlArg) {
-  console.error("Usage: npx tsx scripts/test-generate.ts <url> [--name <label>] [--out <dir>]");
+  console.error("Usage: npx tsx scripts/test-generate.ts <url> [--name <label>] [--out <dir>] [--correction] [--quality draft|standard|quality]");
   process.exit(1);
 }
 
@@ -293,7 +298,7 @@ Produce the skeleton HTML now. Every section shell must have data-section-slug a
       fs.mkdirSync(correctionsDir, { recursive: true });
       const CORRECTION_THRESHOLD = 0.85;
       const PLATEAU_DELTA = 0.01;
-      const MAX_ITER = 2;
+      const MAX_ITER = correctionMaxIter;
       const fragmentMap = new Map(sectionResults.map((r) => [r.slug, r.fragment]));
       let prevScore = 0;
 

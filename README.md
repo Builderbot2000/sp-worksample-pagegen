@@ -44,7 +44,19 @@ The `--quality` flag controls the maximum number of correction iterations run pe
 | `standard` | 2 (default) | ~$2.50–3.50 |
 | `quality` | 3 | ~$3.50–5 |
 
-Output goes to `output/<timestamp>-<name|url-slug>/` and includes `run.ndjson`, `run.json`, `report.html`, and `main/<page>.html`.
+Output goes to `output/<timestamp>-<name|url-slug>/` and includes:
+
+```
+run.ndjson              # append-only event stream
+run.json                # final snapshot (images stripped)
+report.html             # visual report
+main/<page>.html        # generated HTML
+source.png              # full-page source screenshot
+sections/               # per-section source crops (source-<slug>.png)
+fidelity/               # VLM scorer screenshots (main.png, baseline.png, sections/)
+```
+
+The `fidelity/` directory is only written when `--correction` is used (fidelity scoring runs after the correction loop).
 
 ### Reference experiment
 
@@ -113,13 +125,14 @@ npm run test:generate -- <url>
 npm run test:generate -- <url> --name <label>
 npm run test:generate -- <url> --name <label> --out <dir>
 npm run test:generate -- <url> --name <label> --correction
+npm run test:generate -- <url> --name <label> --correction --quality quality
 ```
 
-Output goes to `output/<timestamp>-<name|generate-test>/` and includes `main/<page>.html`, `screenshot.png`, `arch.json`, and `report.html`.
+Output goes to `output/<timestamp>-<name|generate-test>/` and includes `main/<page>.html`, `screenshot.png`, `arch.json`, `sections/` (per-section source and generated crops), and `report.html`.
 
 ```sh
 # Example
-npm run test:generate -- https://stripe.com/payments --name stripe-initial-gen-test
+npm run test:generate -- https://stripe.com/en-ca/payments --name stripe-initial-gen-test --correction --quality quality
 ```
 
 ### Correction loop test
@@ -129,15 +142,17 @@ Runs the full crawl → initial generation → correction loop in isolation and 
 ```sh
 npm run test:correction-loop -- <url>
 npm run test:correction-loop -- <url> --name <label>
+npm run test:correction-loop -- <url> --name <label> --out <dir> --quality quality
 npm run test:correction-loop -- <url> --name <label> --out <dir> --max-iter <n>
 ```
 
 Flags:
 
 ```sh
---name <label>     # label for the output directory (default: correction-loop-test)
---out <dir>        # explicit output directory
---max-iter <n>     # max correction iterations (default: 4)
+--name <label>                  # label for the output directory (default: correction-loop-test)
+--out <dir>                     # explicit output directory
+--quality draft|standard|quality  # sets max iterations: draft=0, standard=2, quality=3 (default: 4 when omitted)
+--max-iter <n>                  # explicit iteration cap — overrides --quality
 ```
 
 Output goes to `output/<timestamp>-<name|correction-loop-test>/` and includes `main/<page>.html` and `report.html`.
@@ -151,7 +166,20 @@ The report shows one card per iteration with:
 
 ```sh
 # Example
-npm run test:correction-loop -- https://stripe.com/payments --name stripe-correction-test
+npm run test:correction-loop -- https://stripe.com/en-ca/payments --name stripe-correction-test --quality standard
+```
+
+### Report regeneration
+
+Regenerates `report.html` for any completed run without re-running the pipeline. Reads `run.json` and the on-disk screenshots saved during the original run.
+
+```sh
+npm run report -- <run-directory>
+```
+
+```sh
+# Example
+npm run report -- output/1775259398171-stripe-correction-test
 ```
 
 ## The Challenge

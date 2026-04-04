@@ -4,6 +4,7 @@
   "main": "src/cli.ts",
   "scripts": {
     "generate": "tsx src/cli.ts",
+    "report": "tsx scripts/report.ts",
     "test:preprocess": "tsx scripts/test-preprocess.ts",
     "test:generate": "tsx scripts/test-generate.ts",
     "test:correction-loop": "tsx scripts/test-correction-loop.ts",

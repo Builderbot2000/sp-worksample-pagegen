@@ -30,7 +30,7 @@ export function assembleSkeleton(
     const re = new RegExp(
       `(<([a-zA-Z][a-zA-Z0-9]*)(?:[^>]*)data-section-slug="${escapedSlug}"(?:[^>]*)>)[\\s\\S]*?(<\\/\\2>)`,
     );
-    const next = html.replace(re, `$1\n${fragment}\n$3`);
+    const next = html.replace(re, (_, open, _tagName, close) => `${open}\n${fragment}\n${close}`);
     if (next === html) {
       missing.push(slug);
     } else {

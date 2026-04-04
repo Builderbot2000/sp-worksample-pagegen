@@ -29,6 +29,7 @@ import {
   scoreSeverity,
 } from "../src/observability/fidelity";
 import { estimateMaxTokens } from "../src/observability/metrics";
+import { resizeForVlm } from "../src/image";
 import type { VisualArchDoc, SectionDiscrepancy } from "../src/observability/types";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -49,13 +50,20 @@ function getFlag(flag: string): string | undefined {
   return i !== -1 ? args[i + 1] : undefined;
 }
 
-const maxIter = parseInt(getFlag("--max-iter") ?? "4", 10);
+const QUALITY_ITER: Record<string, number> = { draft: 0, standard: 2, quality: 3 };
+const qualityArg = getFlag("--quality");
+// --max-iter takes precedence; --quality is a named alias; default is 4
+const maxIter = getFlag("--max-iter") !== undefined
+  ? parseInt(getFlag("--max-iter")!, 10)
+  : qualityArg !== undefined
+    ? (QUALITY_ITER[qualityArg] ?? 4)
+    : 4;
 const nameArg = getFlag("--name");
 const outArg = getFlag("--out");
 
 if (!urlArg) {
   console.error(
-    "Usage: npx tsx scripts/test-correction-loop.ts <url> [--name <label>] [--out <dir>] [--max-iter <n>]",
+    "Usage: npx tsx scripts/test-correction-loop.ts <url> [--name <label>] [--out <dir>] [--quality draft|standard|quality] [--max-iter <n>]",
   );
   process.exit(1);
 }
@@ -64,6 +72,50 @@ if (!urlArg) {
 
 function slugify(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/**
+ * Extracts the outermost HTML element that carries data-section-slug="<slug>"
+ * from the full page HTML. Returns null if the element cannot be found.
+ */
+function extractSectionHtml(html: string, slug: string): string | null {
+  const marker = `data-section-slug="${slug}"`;
+  const markerIdx = html.indexOf(marker);
+  if (markerIdx === -1) return null;
+  const tagStart = html.lastIndexOf("<", markerIdx);
+  if (tagStart === -1) return null;
+  const tagNameMatch = html.slice(tagStart + 1).match(/^([a-zA-Z][a-zA-Z0-9-]*)/);
+  if (!tagNameMatch) return null;
+  const tagName = tagNameMatch[1];
+  let depth = 1;
+  let pos = html.indexOf(">", tagStart) + 1;
+  while (depth > 0 && pos < html.length) {
+    const openIdx = html.indexOf(`<${tagName}`, pos);
+    const closeStr = `</${tagName}>`;
+    const closeIdx = html.indexOf(closeStr, pos);
+    if (closeIdx === -1) return null;
+    if (openIdx !== -1 && openIdx < closeIdx) {
+      depth++;
+      pos = openIdx + 1;
+    } else {
+      depth--;
+      if (depth === 0) return html.slice(tagStart, closeIdx + closeStr.length);
+      pos = closeIdx + 1;
+    }
+  }
+  return null;
+}
+
+/**
+ * Replaces the section element for <slug> in <html> with <newFragment>.
+ * Returns the original string unchanged if the section cannot be located.
+ */
+function replaceSectionHtml(html: string, slug: string, newFragment: string): string {
+  const old = extractSectionHtml(html, slug);
+  if (!old) return html;
+  const idx = html.indexOf(old);
+  if (idx === -1) return html;
+  return html.slice(0, idx) + newFragment + html.slice(idx + old.length);
 }
 
 function esc(s: string): string {
@@ -461,70 +513,90 @@ ${crawlResult.html}
     // No fix pass after the final iteration
     if (i === maxIter - 1) break;
 
-    // ── Fix pass ──────────────────────────────────────────────────────────
+    // ── Per-section fix pass ──────────────────────────────────────────────
+    // Fix each failing section in isolation (avoids full-page output token limits).
 
-    const currentHtml = fs.readFileSync(savedPath!, "utf-8");
-    savedPath = null;
+    const SECTION_MAX_TOKENS = 8_000;
+    let currentHtml = fs.readFileSync(savedPath!, "utf-8");
+    const basename = path.basename(savedPath!);
+    const sectionsToFix = discrepancies.filter(
+      (d) => d.severity === "high" || d.severity === "medium",
+    );
 
-    const fixSaveFile = betaZodTool({
-      name: "save_file",
-      description: "Save the rewritten HTML page to disk.",
-      inputSchema: z.object({
-        filename: z.string().describe("Same kebab-case filename as the original."),
-        content: z.string().describe("The complete rewritten HTML content of the page."),
+    console.log(
+      `[correction-loop] Fix pass with ${FIX_MODEL} — fixing ${sectionsToFix.length} section(s)...`,
+    );
+
+    const fixes = await Promise.all(
+      sectionsToFix.map(async (disc) => {
+        const spec = archDoc.sections.find((s) => s.slug === disc.slug);
+        if (!spec) return null;
+
+        const currentFragment = extractSectionHtml(currentHtml, disc.slug);
+        if (!currentFragment) {
+          console.warn(`[correction-loop] Could not extract section "${disc.slug}" — skipping.`);
+          return null;
+        }
+
+        const sourceScreenshot = crawlResult.sourceSectionScreenshots[disc.slug]?.[0];
+        let fixedFragment: string | null = null;
+
+        const saveSection = betaZodTool({
+          name: "save_section",
+          description: "Output the corrected HTML for this section.",
+          inputSchema: z.object({
+            fragment: z
+              .string()
+              .describe(
+                "The complete corrected HTML for this section element only — not the full page. MUST keep data-section-slug and data-section-order attributes on the root element.",
+              ),
+          }),
+          run: async (input) => {
+            fixedFragment = input.fragment;
+            return JSON.stringify({ success: true });
+          },
+        });
+
+        const userContent: Anthropic.MessageParam["content"] = [];
+        if (sourceScreenshot) {
+          const resized = await resizeForVlm(sourceScreenshot);
+          userContent.push({
+            type: "image",
+            source: { type: "base64", media_type: "image/jpeg", data: resized.toString("base64") },
+          });
+          userContent.push({ type: "text", text: `SOURCE screenshot for section "${disc.slug}" (${spec.role}) above.` });
+        }
+        userContent.push({
+          type: "text",
+          text: `Fix the following issues in section "${disc.slug}" (${spec.role}):\n<issues>\n${disc.issues.join("\n")}\n</issues>\n\n<current_fragment>\n${currentFragment}\n</current_fragment>\n\nOutput ONLY the corrected section HTML via save_section. Keep data-section-slug="${disc.slug}" and data-section-order="${spec.order}" on the root element.`,
+        });
+
+        const fixRunner = client.beta.messages.toolRunner({
+          model: FIX_MODEL,
+          max_tokens: SECTION_MAX_TOKENS,
+          tools: [saveSection],
+          tool_choice: { type: "tool", name: "save_section" },
+          stream: true,
+          max_iterations: 2,
+          system: `You are an expert front-end developer fixing a single section of a generated HTML page. Rewrite ONLY the section element to fix the listed issues. Output the section HTML fragment — not the full page. Preserve all data-* attributes on the root element.`,
+          messages: [{ role: "user", content: userContent }],
+        });
+
+        await renderStream(fixRunner);
+        return fixedFragment ? { slug: disc.slug, fragment: fixedFragment } : null;
       }),
-      run: async (input) => {
-        const outPath = path.join(mainDir, input.filename);
-        fs.writeFileSync(outPath, input.content, "utf-8");
-        savedPath = outPath;
-        return JSON.stringify({ success: true, file_path: outPath });
-      },
-    });
+    );
 
-    const discrepancyList = discrepancies
-      .map((d) => {
-        const spec = archDoc.sections.find((s) => s.slug === d.slug);
-        return `[${d.severity}] ${d.slug} (${spec?.role ?? "section"}): ${d.issues.join("; ")}`;
-      })
-      .join("\n");
-
-    console.log(`[correction-loop] Fix pass with ${FIX_MODEL}...`);
-
-    const fixRunner = client.beta.messages.toolRunner({
-      model: FIX_MODEL,
-      max_tokens: estimateMaxTokens(currentHtml.length, FIX_MODEL),
-      tools: [fixSaveFile],
-      tool_choice: { type: "tool", name: "save_file" },
-      stream: true,
-      max_iterations: 1,
-      system: `You are an expert front-end developer fixing visual fidelity issues in a generated HTML page. Rewrite the complete HTML document fixing the listed discrepancies. Preserve sections that are already correct. All sections MUST keep their data-section-slug and data-section-order attributes.`,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: "image/png",
-                data: crawlResult.screenshotBase64,
-              },
-            },
-            {
-              type: "text",
-              text: `SOURCE page above.\n\n<visual_architecture>\n${archDocText}\n</visual_architecture>\n\n<discrepancies>\n${discrepancyList}\n</discrepancies>\n\nRewrite the complete HTML fixing the listed discrepancies. Each section root MUST keep its data-section-slug and data-section-order attributes.\n\n<current_html>\n${currentHtml}\n</current_html>`,
-            },
-          ],
-        },
-      ],
-    });
-
-    await renderStream(fixRunner);
-
-    if (!savedPath) {
-      console.warn("[correction-loop] Fix pass did not save — stopping loop.");
-      break;
+    for (const fix of fixes) {
+      if (!fix) continue;
+      const updated = replaceSectionHtml(currentHtml, fix.slug, fix.fragment);
+      if (updated !== currentHtml) {
+        currentHtml = updated;
+        console.log(`[correction-loop] Applied fix for "${fix.slug}"`);
+      }
     }
+
+    fs.writeFileSync(savedPath!, currentHtml, "utf-8");
   }
 
   // ── Report ─────────────────────────────────────────────────────────────────

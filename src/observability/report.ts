@@ -297,6 +297,50 @@ function buildFidelitySection(fidelity: FidelityMetrics): string {
   </section>`;
 }
 
+// ─── Screenshot hydration ────────────────────────────────────────────────
+
+/**
+ * Re-fills the base64 image fields that recorder.ts strips when writing run.json,
+ * using the PNG files persisted on disk under screenshotPaths.
+ * Returns the hydrated record and the source thumbnail for generateReport().
+ */
+export function hydrateScreenshots(
+  runDir: string,
+  record: RunRecord,
+): { record: RunRecord; sourceThumbnail?: string } {
+  const paths = record.screenshotPaths;
+
+  const tryRead = (rel: string | undefined): string | undefined => {
+    const abs = path.join(runDir, rel as string);
+    return fs.existsSync(abs) ? fs.readFileSync(abs).toString('base64') : undefined;
+  };
+
+  const sourceb64 = tryRead(paths?.source);
+  const fidelityMainb64 = tryRead(paths?.fidelityMain);
+  const fidelityBaselineb64 = tryRead(paths?.fidelityBaseline);
+
+  const out: RunRecord = { ...record };
+
+  if (out.fidelityMetrics) {
+    out.fidelityMetrics = {
+      ...out.fidelityMetrics,
+      sourceScreenshotBase64: sourceb64 ?? out.fidelityMetrics.sourceScreenshotBase64 ?? '',
+      mainScreenshotBase64: fidelityMainb64 ?? out.fidelityMetrics.mainScreenshotBase64 ?? '',
+      ...(fidelityBaselineb64 !== undefined ? { baselineScreenshotBase64: fidelityBaselineb64 } : {}),
+    };
+  }
+
+  if (out.baseline) {
+    out.baseline = {
+      ...out.baseline,
+      mainThumbnail: fidelityMainb64 ?? out.baseline.mainThumbnail,
+      ...(fidelityBaselineb64 !== undefined ? { baselineThumbnail: fidelityBaselineb64 } : {}),
+    };
+  }
+
+  return { record: out, sourceThumbnail: sourceb64 };
+}
+
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 export function generateReport(
