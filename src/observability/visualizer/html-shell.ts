@@ -90,41 +90,19 @@ export function buildHtmlShell(p: HtmlShellParams): string {
       </div>
     </div>
 
-    <!-- Slide 3: Sections & Correction -->
-    <div class="slide" id="slide-3" style="display:block;overflow-y:auto">
-      <div class="card-lbl" style="margin-bottom:0.75rem">Section Generation &amp; Correction</div>
-      <div class="tracks-container" id="tracks"></div>
+    <!-- Slide 3: Sections & Assembly -->
+    <div class="slide" id="slide-3">
+      <div class="sxa-table">
+        <div class="sxa-hdr">
+          <div class="sxa-hdr-col">Reference</div>
+          <div class="sxa-hdr-col" id="sxa-gen-lbl">Generation</div>
+        </div>
+        <div id="sxa-rows"></div>
+      </div>
     </div>
 
-    <!-- Slide 4: Assembly & Finish -->
+    ${hasFidelity ? `<!-- Slide 4: End -->
     <div class="slide" id="slide-4">
-      <div class="asm-left card">
-        <div class="card-lbl">Assembled Sections</div>
-        <div class="fly-chips" id="fly-chips"></div>
-        <div class="kv" id="asm-stats" style="margin-top:0.6rem;display:none">
-          <div class="kk">HTML size</div><div class="kv_val" id="asm-size">—</div>
-          <div class="kk">Duration</div><div class="kv_val" id="asm-dur">—</div>
-        </div>
-      </div>
-      <div class="asm-right card">
-        <div class="card-lbl">Result</div>
-        <div id="asm-placeholder" style="color:#4b5563;font-size:0.78rem;padding:1rem 0">Waiting for assembly…</div>
-        <div id="asm-twoups" style="display:none">
-          <div class="two-up">
-            <div><div class="two-up-lbl">Source</div><img id="asm-src" class="ss" src="" /></div>
-            <div><div class="two-up-lbl">Generated</div><img id="asm-gen" class="ss" src="" /></div>
-          </div>
-          <div class="summary-tiles">
-            <div class="sum-tile" id="sum-score"><div class="s-val" id="sum-score-val">—</div><div class="s-lbl">Final Score</div></div>
-            <div class="sum-tile" id="sum-cost"><div class="s-val">$${estimatedCostUsd.toFixed(2)}</div><div class="s-lbl">Est. Cost</div></div>
-            <div class="sum-tile" id="sum-dur"><div class="s-val">${formatDuration(durationMs)}</div><div class="s-lbl">Duration</div></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    ${hasFidelity ? `<!-- Slide 5: End -->
-    <div class="slide" id="slide-5">
       <div class="fi-wrap" style="max-width:none;flex:1;min-width:0">
         <div class="card-lbl" style="margin-bottom:0.75rem">Pipeline Complete</div>
         <div class="two-up" style="margin-bottom:0.85rem">
@@ -137,7 +115,7 @@ export function buildHtmlShell(p: HtmlShellParams): string {
             <div class="img-pan-wrap"><img id="fi-img" class="ss" src="" style="display:none" /></div>
           </div>
         </div>
-        <div style="display:flex;align-items:center;gap:0.8rem;margin-bottom:0.5rem">
+        <div id="fi-score-row" style="display:flex;align-items:center;gap:0.8rem;margin-bottom:0.5rem">
           <div class="score-big" id="fi-score" style="color:#6b7280">—</div>
           <span id="fi-verdict" style="font-size:0.72rem;font-weight:600;border-radius:999px;padding:0.2rem 0.6rem;background:#21262d;color:#9ca3af"></span>
         </div>

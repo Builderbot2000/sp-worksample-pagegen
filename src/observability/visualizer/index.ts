@@ -50,7 +50,7 @@ export function generateVisualizer(runDir: string, events: LogLine[], record: Ru
   }
   const skeletonHtmlJson = safeJson(skeletonHtmlContent);
 
-  const slideLabels = ["Start", "Preprocess", "Skeleton", "Sections", "Assembly", ...(hasFidelity ? ["End"] : [])];
+  const slideLabels = ["Start", "Preprocess", "Skeleton", "Sections & Assembly", ...(hasFidelity ? ["End"] : [])];
   const slidePills = slideLabels
     .map((lbl, i) => `<button class="pill" data-slide="${i}" onclick="manualGoToSlide(${i})">${escHtml(lbl)}</button>`)
     .join("");

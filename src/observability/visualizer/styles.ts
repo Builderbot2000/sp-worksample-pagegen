@@ -78,50 +78,36 @@ export const vizStyles = `
     .stat-tile .val{font-size:1.1rem;font-weight:700;color:#f9fafb}
     .stat-tile .lbl{font-size:0.58rem;color:#6b7280;text-transform:uppercase;margin-top:0.15rem}
 
-    /* ── Slide 3: Sections & Correction ── */
-    .tracks-container{max-width:1100px;width:100%;margin:0 auto;display:flex;flex-direction:column;gap:0.55rem}
-    .track-row{background:#161b22;border:1px solid #21262d;border-radius:7px;padding:0.5rem 0.6rem}
-    .track-header{display:flex;align-items:center;gap:0.45rem;margin-bottom:0.4rem}
-    .track-num{font-size:0.72rem;font-weight:700;color:#9ca3af;min-width:2.5rem}
-    .track-role{font-size:0.6rem;background:#21262d;color:#9ca3af;border-radius:999px;padding:0.1rem 0.4rem}
-    .track-score-badge{font-size:0.62rem;font-weight:700;border-radius:999px;padding:0.1rem 0.45rem;margin-left:auto}
-    .track-desc{font-size:0.6rem;color:#6b7280;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .track-timeline{display:flex;gap:0.45rem;overflow-x:auto;padding-bottom:0.2rem;scrollbar-width:thin;scrollbar-color:#30363d transparent}
-    .tl-cell{flex:0 0 160px;border-radius:5px;overflow:hidden;border:2px solid #21262d;transition:border-color 0.2s;display:flex;flex-direction:column}
-    .tl-cell.active-cell{border-color:#3b82f6;box-shadow:0 0 0 2px #3b82f620}
-    .tl-cell.grad-cell{border-color:#22c55e;box-shadow:0 0 0 2px #22c55e20}
-    .tl-cell-img{position:relative;flex-shrink:0}
-    .tl-cell img{width:100%;display:block;height:110px;object-fit:cover}
-    .tl-cell .tl-no-img{width:160px;height:110px;display:flex;align-items:center;justify-content:center;font-size:0.6rem;color:#4b5563;background:#0d1117}
-    .tl-overlay{position:absolute;bottom:0;left:0;right:0;padding:0.15rem 0.3rem;font-size:0.55rem;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:space-between;background:linear-gradient(transparent,#00000099)}
-    .tl-verdict{font-size:0.48rem;font-weight:600;border-radius:999px;padding:0.05rem 0.3rem;margin-left:0.2rem;opacity:0.9}
-    .tl-label{position:absolute;top:2px;left:3px;font-size:0.5rem;color:#9ca3af;background:#00000060;padding:0.05rem 0.2rem;border-radius:2px}
-    .tl-issues{padding:0.25rem 0.35rem;font-size:0.5rem;color:#9ca3af;line-height:1.35;background:#0d1117;border-top:1px solid #21262d;overflow:hidden;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical}
-    .tl-pending{width:160px;height:110px;display:flex;align-items:center;justify-content:center;font-size:1.2rem;color:#374151;background:#0d1117;border-radius:3px}
-    .track-row[data-status=idle]{opacity:0.4}
-    .track-row[data-status=active]{border-color:#1e3a5f}
-    .track-row[data-status=complete]{border-color:#14532d30}
+    /* ── Slide 3: Sections & Assembly ── */
+    #slide-3{flex-direction:column;align-items:stretch;overflow-y:auto;padding:1.25rem}
+    .sxa-table{width:100%;display:flex;flex-direction:column;gap:0.5rem;flex:1}
+    .sxa-hdr{display:flex;gap:0.5rem;flex-shrink:0}
+    .sxa-hdr-col{flex:1;min-width:0;font-size:0.6rem;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:0.07em}
+    #sxa-rows{display:flex;flex-direction:column;gap:0.5rem}
+    .sxa-row{display:flex;align-items:stretch;gap:0.5rem;max-height:166px}
+    .sxa-row-ref,.sxa-row-gen{flex:1;min-width:0;border-radius:6px;overflow:hidden;border:1px solid #21262d;background:#0d1117;display:flex;flex-direction:column}
+    .sxa-row-ref img,.sxa-row-gen img{width:100%;display:block;max-height:140px;object-fit:cover;flex:1;min-height:0}
+    .sec-lbl{font-size:0.55rem;color:#6b7280;padding:0.25rem 0.4rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0;background:#0d1117;border-top:1px solid #21262d}
+    .sec-shimmer{flex:1;min-height:60px;max-height:140px;border-radius:0}
+    /* Score bar under gen cell */
+    .fc-score-bar{padding:0.2rem 0.4rem;font-size:0.6rem;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:space-between;background:#0d1117;border-top:1px solid #21262d;flex-shrink:0;border-left:2px solid var(--fc-border,#374151)}
+    .fc-score-dot{width:7px;height:7px;border-radius:50%;background:var(--fc-border,#374151);flex-shrink:0}
+    .fc-verdict{font-size:0.52rem;opacity:0.8}
+    .sxa-row-gen{position:relative}
+    .sxa-row-gen.locked{border-top:2px solid var(--fc-border,#374151)}
+    .iter-badge{position:absolute;top:4px;right:4px;font-size:0.48rem;font-weight:700;padding:0.13rem 0.32rem;border-radius:4px;background:#0d111799;border:1px solid #3b82f655;color:#93c5fd;pointer-events:none;z-index:2;letter-spacing:0.05em;backdrop-filter:blur(2px)}
+    @keyframes fc-flash{0%,100%{opacity:1}50%{opacity:0.4}}
+    .sxa-row-gen.flashing{animation:fc-flash 0.45s ease}
+    @keyframes sxa-scan{0%{border-color:#60a5fa;box-shadow:0 0 0 1px #60a5fa}60%{border-color:#60a5fa;box-shadow:0 0 0 1px #60a5fa}100%{border-color:#21262d;box-shadow:none}}
+    .sxa-row.scanning{animation:sxa-scan 0.65s ease-out forwards}
 
-    /* ── Slide 4: Assembly ── */
-    #slide-4{justify-content:center}
-    .asm-left{flex:1;min-width:0;max-width:560px}
-    .asm-right{flex:1;min-width:0;max-width:560px}
-    .fly-chips{display:flex;flex-wrap:wrap;gap:0.35rem;min-height:120px}
-    .fly-chip{padding:0.2rem 0.55rem;border-radius:999px;font-size:0.65rem;font-weight:600;opacity:0}
-    .two-up{display:grid;grid-template-columns:1fr 1fr;gap:0.7rem}
-    .two-up-lbl{font-size:0.6rem;font-weight:600;text-transform:uppercase;color:#6b7280;margin-bottom:0.3rem}
-    .summary-tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:0.5rem;margin-top:0.75rem}
-    .sum-tile{background:#0d1117;border:1px solid #21262d;border-radius:7px;padding:0.7rem;text-align:center;opacity:0}
-    .sum-tile .s-val{font-size:1.5rem;font-weight:700;color:#f9fafb}
-    .sum-tile .s-lbl{font-size:0.58rem;color:#6b7280;text-transform:uppercase;margin-top:0.1rem}
-
-    /* ── Slide 5: End ── */
+    /* ── Slide 4: End ── */
     .fi-wrap{max-width:800px;width:100%;margin:0 auto}
-    #slide-5{overflow:hidden;align-items:stretch}
-    #slide-5 .fi-wrap{display:flex;flex-direction:column}
-    #slide-5 .two-up{flex:1;min-height:0}
-    #slide-5 .two-up>div{display:flex;flex-direction:column;min-height:0}
-    #slide-5 .img-pan-wrap{flex:1;max-height:none;min-height:0}
+    #slide-4{overflow:hidden;align-items:stretch}
+    #slide-4 .fi-wrap{display:flex;flex-direction:column}
+    #slide-4 .two-up{display:flex;gap:0.85rem;flex:1;min-height:0}
+    #slide-4 .two-up>div{display:flex;flex-direction:column;min-height:0}
+    #slide-4 .img-pan-wrap{flex:1;max-height:none;min-height:0}
 
     /* ── Entrance animation (used by GSAP) ── */
 
@@ -129,10 +115,7 @@ export const vizStyles = `
     .img-pan-wrap{width:100%;overflow:hidden;border-radius:5px;border:1px solid #21262d;max-height:420px}
     .img-pan-wrap img{width:100%;display:block}
 
-    /* ── Track reference separator ── */
-    .tl-sep{flex-shrink:0;width:2px;background:#30363d;border-radius:1px;align-self:stretch;margin:0 4px;min-height:80px}
-    .tl-cell.tl-ref-style{border-color:#374151 !important}
-    .tl-ref-label{position:absolute;top:2px;left:3px;font-size:0.5rem;font-weight:700;color:#60a5fa;background:#00000080;padding:0.05rem 0.25rem;border-radius:2px}
+    /* ── Track reference separator (kept for potential reuse elsewhere) ── */
 
     /* ── Playback bar ── */
     .pb{flex-shrink:0;padding:0.55rem 1.25rem;background:#161b22;border-top:1px solid #21262d}

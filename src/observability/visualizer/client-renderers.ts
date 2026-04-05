@@ -16,6 +16,18 @@ function scrollSlide1To(slug) {
   slideEl.scrollBy({ top: midY - slideCenter, behavior: 'smooth' });
 }
 
+function scrollSlide3To(slug) {
+  var slideEl = document.getElementById('slide-3');
+  if (!slideEl) return;
+  var rowEl = document.getElementById('sxar-' + slug);
+  if (!rowEl) return;
+  var slideRect = slideEl.getBoundingClientRect();
+  var rowRect = rowEl.getBoundingClientRect();
+  var midY = (rowRect.top + rowRect.bottom) / 2;
+  var slideCenter = (slideRect.top + slideRect.bottom) / 2;
+  slideEl.scrollBy({ top: midY - slideCenter, behavior: 'smooth' });
+}
+
 var _lastRenderedSlide1Count = -1;
 function renderSlide1(state) {
   var entryDelay = _newSlideEntryDelay; _newSlideEntryDelay = 0;
@@ -132,137 +144,212 @@ function renderSlide2(state) {
   }
 }
 
-function renderSlide3(state, ev) {
-  var slugKeys = Object.keys(state.sections);
-  slugKeys.forEach(function(slug) {
-    var sec = state.sections[slug];
-    var row = document.getElementById('track-' + slug);
-    if (!row) return;
-    var prevStatusAttr = row.getAttribute('data-status');
-    row.setAttribute('data-status', sec.status);
-    if (sec.status === 'active' && prevStatusAttr !== 'active') {
-      setTimeout(function() { row.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, 100);
-    }
-    // Score badge
-    var badge = document.getElementById('tsb-' + slug);
-    if (badge && sec.score !== null) {
-      var clr = scoreColor(sec.score);
-      badge.style.display = '';
-      badge.textContent = sec.score.toFixed(2);
-      badge.style.background = scoreColorBg(sec.score);
-      badge.style.color = clr;
-    }
-    // Build timeline cells
-    var tl = document.getElementById('tl-' + slug);
-    if (!tl) return;
-    var cells = [];
-    // Reference cell first \u2014 shown as soon as section is known
-    if (sec.status !== 'idle') {
-      var refSrc = sp && sp.sections && sp.sections[slug] ? sp.sections[slug] : null;
-      var isRefActive = ev && ev.data && ev.data.slug === slug &&
-        (ev.phase === 'section:start' || ev.phase === 'section:complete');
-      cells.push({ type: 'ref', img: refSrc, active: isRefActive });
-      cells.push({ type: 'sep' });
-    }
-    // Correction iteration cells
-    state.corrections.forEach(function(it) {
-      if (it.activeSlugs.indexOf(slug) < 0 && !it.scores[slug]) return;
-      var sc = it.scores[slug];
-      var isFix = it.sectionFix[slug] === 'fixing';
-      var clr = sc ? scoreColor(sc.score) : null;
-      var genPath = sc ? sc.genPath : null;
-      var isActiveDuringThisIter = ev && ev.data &&
-        ((ev.phase === 'section-score' && ev.data.iteration === it.iter && ev.data.slug === slug) ||
-         (ev.phase === 'section-correction:start' && ev.data.iteration === it.iter && ev.data.slug === slug) ||
-         (ev.phase === 'section-correction:complete' && ev.data.iteration === it.iter && ev.data.slug === slug) ||
-         (ev.phase === 'correction-iter:start' && ev.data.iteration === it.iter) ||
-         (ev.phase === 'correction-iter:complete' && ev.data.iteration === it.iter));
-      cells.push({ type: 'gen', label: 'iter ' + it.iter, img: genPath, score: sc ? sc.score : null, clr: clr, active: isActiveDuringThisIter, fixing: isFix, verdict: sc ? sc.verdict : null, issues: sc ? sc.issues : null });
+function animateSlide3Entry(state) {
+  // Build trips: trip 0 = initial generation; trip k (k≥1) = correction iteration k-1
+  var trips = [{ slugs: state.sectionOrder.slice(), isInitial: true, corrIdx: -1 }];
+  state.corrections.forEach(function(corr, k) {
+    trips.push({ slugs: (corr.activeSlugs || []).slice(), isInitial: false, corrIdx: k });
+  });
+
+  var initStagger  = 400;  // ms between rows on initial trip
+  var corrStagger  = 250;  // ms between rows on correction trips
+  var betweenTrips = 1000; // ms pause between trips
+
+  // Compute absolute start time for each trip
+  var t = 0;
+  trips.forEach(function(trip, tripIdx) {
+    trip.startT = t;
+    t += trip.slugs.length * (trip.isInitial ? initStagger : corrStagger);
+    if (tripIdx < trips.length - 1) t += betweenTrips;
+  });
+
+  setReadyAfter(t + 800);
+
+  // Iter 1 scores represent the initial generation quality (scored before any corrections run)
+  var initScores = (state.corrections.length > 0 && state.corrections[0].scores) ? state.corrections[0].scores : null;
+
+  trips.forEach(function(trip) {
+    var stagger = trip.isInitial ? initStagger : corrStagger;
+    var corrObj = trip.corrIdx >= 0 ? state.corrections[trip.corrIdx] : null;
+    var iterLabel = corrObj ? ('Iter ' + corrObj.iter) : null;
+
+    trip.slugs.forEach(function(slug, i) {
+      var absDelay = trip.startT + i * stagger;
+
+      // Pre-scroll: center this row just before the scan arrives
+      setTimeout(function() { scrollSlide3To(slug); }, Math.max(0, absDelay - 220));
+
+      setTimeout(function() {
+        var rowEl = document.getElementById('sxar-' + slug);
+        if (!rowEl) return;
+        var genCell = document.getElementById('sxag-' + slug);
+
+        if (trip.isInitial) {
+          // Fade the whole row in as a pair (ref + gen)
+          gsap.fromTo(rowEl, { opacity: 0, y: 6 }, { opacity: 1, y: 0, duration: 0.3, ease: 'power2.out', clearProps: 'transform' });
+
+          // Hydrate gen cell from iter-1 scores (initial gen quality snapshot)
+          if (genCell && initScores) {
+            var sd = initScores[slug];
+            if (sd) {
+              var clr0 = scoreColor(sd.score);
+              genCell.style.setProperty('--fc-border', clr0);
+              var dot0 = genCell.querySelector('.fc-score-dot'); if (dot0) dot0.style.background = clr0;
+              var vd0  = genCell.querySelector('.fc-verdict');   if (vd0)  { vd0.textContent = sd.verdict || ''; vd0.style.color = clr0; }
+              var sv0  = genCell.querySelector('.fc-score-val'); if (sv0)  { sv0.textContent = sd.score.toFixed(2); sv0.style.color = clr0; }
+              if (sd.genPath) {
+                var sh0 = genCell.querySelector('.sec-shimmer');
+                if (sh0) {
+                  var src0 = sd.genPath;
+                  sh0.outerHTML = '<img src="' + esc(src0) + '" style="opacity:0" />';
+                  var img0 = genCell.querySelector('img');
+                  if (img0) gsap.to(img0, { opacity: 1, duration: 0.3 });
+                }
+              }
+              genCell.classList.add('locked');
+            }
+          }
+        }
+
+        // Scan border sweep on every trip
+        rowEl.classList.remove('scanning');
+        void rowEl.offsetWidth;
+        rowEl.classList.add('scanning');
+
+        // Correction trips: fade-replace gen cell content with this iteration's data
+        if (!trip.isInitial && corrObj && genCell) {
+          var scoreData = corrObj.scores ? corrObj.scores[slug] : null;
+          if (!scoreData) return;
+
+          var clr = scoreColor(scoreData.score);
+          genCell.style.setProperty('--fc-border', clr);
+          var dot = genCell.querySelector('.fc-score-dot'); if (dot) dot.style.background = clr;
+          var vd  = genCell.querySelector('.fc-verdict');   if (vd)  { vd.textContent = scoreData.verdict || ''; vd.style.color = clr; }
+          var sv  = genCell.querySelector('.fc-score-val'); if (sv)  { sv.textContent = scoreData.score.toFixed(2); sv.style.color = clr; }
+
+          if (scoreData.genPath) {
+            var existImg = genCell.querySelector('img');
+            if (existImg) {
+              var newPath = scoreData.genPath;
+              gsap.to(existImg, { opacity: 0, duration: 0.18, onComplete: function() {
+                existImg.src = newPath;
+                gsap.to(existImg, { opacity: 1, duration: 0.3 });
+              }});
+            } else {
+              var sh = genCell.querySelector('.sec-shimmer');
+              if (sh) {
+                var newSrc = scoreData.genPath;
+                gsap.to(sh, { opacity: 0, duration: 0.18, onComplete: function() {
+                  sh.outerHTML = '<img src="' + esc(newSrc) + '" style="opacity:0" />';
+                  var newImg = genCell.querySelector('img');
+                  if (newImg) gsap.to(newImg, { opacity: 1, duration: 0.3 });
+                }});
+              }
+            }
+          }
+
+          genCell.classList.add('locked');
+          genCell.classList.remove('flashing');
+          void genCell.offsetWidth;
+          genCell.classList.add('flashing');
+          setTimeout(function() { genCell.classList.remove('flashing'); }, 500);
+        }
+
+        // Show iteration label badge on correction trips
+        if (iterLabel && genCell) {
+          var badge = genCell.querySelector('.iter-badge');
+          if (badge) { badge.textContent = iterLabel; badge.style.display = ''; }
+        }
+      }, absDelay);
     });
-    if (cells.length === 0 && sec.status === 'idle') {
-      tl.innerHTML = '<div class="tl-pending">\u25cb</div>';
-      return;
-    }
-    // Determine if section is graduated
-    var lastScore = sec.score;
-    var graduated = lastScore !== null && lastScore >= 0.70;
-    tl.innerHTML = cells.map(function(cell) {
-      if (cell.type === 'sep') return '<div class="tl-sep"></div>';
-      var isRef = cell.type === 'ref';
-      var clsExtra = isRef ? ' tl-ref-style' : (cell.active ? ' active-cell' : (graduated ? ' grad-cell' : ''));
-      var borderClr = isRef ? '#374151' : (cell.active ? '#3b82f6' : (graduated ? '#22c55e' : (cell.clr || '#21262d')));
-      var inner = cell.img
-        ? '<img src="' + esc(cell.img) + '" loading="lazy" />'
-        : '<div class="tl-no-img">' + (isRef ? '?' : '\u2026') + '</div>';
-      var verdBadge = (!isRef && cell.verdict)
-        ? '<span class="tl-verdict" style="background:' + (cell.clr||'#6b7280') + '33;color:' + (cell.clr||'#6b7280') + '">' + esc(cell.verdict) + '</span>' : '';
-      var scoreOverlay = (!isRef && cell.score !== null)
-        ? '<div class="tl-overlay"><span>' + cell.score.toFixed(2) + '</span>' + verdBadge + '</div>' : '';
-      var lbl = isRef
-        ? '<div class="tl-ref-label">REF</div>'
-        : '<div class="tl-label">' + esc(cell.label) + (cell.fixing ? ' \uD83D\uDD27' : '') + '</div>';
-      var issuesHtml = (!isRef && cell.issues && cell.issues.length)
-        ? '<div class="tl-issues">' + cell.issues.map(function(s){ return esc(s); }).join(' \u00b7 ') + '</div>' : '';
-      return '<div class="tl-cell' + clsExtra + '" style="border-color:' + borderClr + '"><div class="tl-cell-img">' + inner + scoreOverlay + lbl + '</div>' + issuesHtml + '</div>';
-    }).join('');
-    // Scroll active cell into view
-    if (ev) {
-      var activeCellEl = tl.querySelector('.active-cell');
-      if (activeCellEl) activeCellEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
-    }
   });
 }
 
-function renderSlide4(state) {
-  var asm = state.assemble;
-  var chips = document.getElementById('fly-chips');
-  // Always show section chips, landed or not
-  var slugKeys = Object.keys(state.sections);
-  slugKeys.sort(function(a, b) { return (state.sections[a].order || 0) - (state.sections[b].order || 0); });
-  var existingIds = {};
-  Array.from(chips.children).forEach(function(c) { existingIds[c.id] = true; });
-  slugKeys.forEach(function(slug, idx) {
+function renderSlide3(state, ev) {
+  var phase = ev ? ev.phase : '';
+  var evData = ev ? (ev.data || {}) : {};
+
+  // Pill-nav entry: scan each row sequentially
+  if (_slide3EntryPending) {
+    _slide3EntryPending = false;
+    animateSlide3Entry(state);
+    return;
+  }
+
+  // Pop row in on section:start (normal playthrough)
+  if (phase === 'section:start') {
+    var rowEl = document.getElementById('sxar-' + evData.slug);
+    if (rowEl) gsap.fromTo(rowEl, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.3, ease: 'power2.out', clearProps: 'transform' });
+    return;
+  }
+
+  // ── Hydrate all accumulated gen state into DOM (safe to re-run) ──
+  var toReveal = [];
+  state.sectionOrder.forEach(function(slug) {
     var sec = state.sections[slug];
-    if (!existingIds['fc-' + slug]) {
-      var clr = sec.score !== null ? scoreColor(sec.score) : '#6b7280';
-      var chip = document.createElement('span');
-      chip.className = 'fly-chip chip'; chip.id = 'fc-' + slug;
-      chip.style.background = clr + '22'; chip.style.color = clr; chip.style.border = '1px solid ' + clr + '44';
-      chip.textContent = slug.replace('section-', '\u00a7');
-      chips.appendChild(chip);
-      // Stagger land animation
-      gsap.fromTo(chip, { opacity: 0, x: -20 }, { opacity: 1, x: 0, duration: 0.3, delay: idx * 0.06, ease: 'power1.out' });
-    } else {
-      // Update color if score arrived
-      var chip = document.getElementById('fc-' + slug);
-      if (chip && sec.score !== null) {
-        var clr = scoreColor(sec.score);
-        chip.style.background = clr + '22'; chip.style.color = clr; chip.style.border = '1px solid ' + clr + '44';
-      }
+    if (!sec) return;
+    var rowEl = document.getElementById('sxar-' + slug);
+    if (rowEl && rowEl.style.opacity === '0') toReveal.push(rowEl);
+    var genCell = document.getElementById('sxag-' + slug);
+    if (!genCell) return;
+    if (sec.genPath) {
+      var existImg = genCell.querySelector('img');
+      if (existImg) { existImg.src = sec.genPath; }
+      else { var sh = genCell.querySelector('.sec-shimmer'); if (sh) sh.outerHTML = '<img src="' + esc(sec.genPath) + '" />'; }
+    }
+    if (sec.score !== null) {
+      var clr = scoreColor(sec.score);
+      genCell.style.setProperty('--fc-border', clr);
+      var dot = genCell.querySelector('.fc-score-dot'); if (dot) dot.style.background = clr;
+      var vd = genCell.querySelector('.fc-verdict'); if (vd) { vd.textContent = sec.verdict || ''; vd.style.color = clr; }
+      var sv = genCell.querySelector('.fc-score-val'); if (sv) { sv.textContent = sec.score.toFixed(2); sv.style.color = clr; }
+    }
+    if (state.assemble.status === 'complete' && phase !== 'assemble:complete') {
+      genCell.classList.add('locked');
     }
   });
-  if (asm.data) {
-    var statsEl = document.getElementById('asm-stats');
-    if (statsEl) { statsEl.style.display = ''; document.getElementById('asm-size').textContent = fmtBytes(asm.data.htmlSizeBytes); document.getElementById('asm-dur').textContent = fmtMs(asm.data.durationMs); }
-    // Show two-up
-    document.getElementById('asm-placeholder').style.display = 'none';
-    document.getElementById('asm-twoups').style.display = '';
-    var srcImg = document.getElementById('asm-src');
-    if (srcImg && sp && sp.source) srcImg.src = sp.source;
-    var genImg = document.getElementById('asm-gen');
-    if (genImg && sp && sp.fidelityMain) genImg.src = sp.fidelityMain;
+  if (toReveal.length > 0) {
+    gsap.fromTo(toReveal, { opacity: 0, y: 8 }, { opacity: 1, y: 0, duration: 0.3, stagger: 0.05, ease: 'power2.out', clearProps: 'transform' });
   }
-  if (state.runComplete) {
-    // Show summary tiles
-    ['sum-score','sum-cost','sum-dur'].forEach(function(id) {
-      var el = document.getElementById(id);
-      if (el) gsap.to(el, { opacity: 1, y: 0, duration: 0.4, ease: 'power1.out' });
-    });
-    var fiData = state.fidelity.data;
-    if (fiData) {
-      var scoreEl = document.getElementById('sum-score-val');
-      if (scoreEl) { scoreEl.textContent = fiData.mainScore.toFixed(3); scoreEl.style.color = scoreColor(fiData.mainScore); }
+  // ─────────────────────────────────────────────────────
+
+  // Flash gen cell + update image on score event
+  if (phase === 'section-score' || phase === 'section-correction:complete') {
+    var slug = evData.slug;
+    var score = evData.score;
+    var verdict = evData.verdict || '';
+    var genPathNew = evData.generatedScreenshotPath || null;
+    var clr = scoreColor(score);
+    var genCell = document.getElementById('sxag-' + slug);
+    if (genCell) {
+      genCell.style.setProperty('--fc-border', clr);
+      if (genPathNew) {
+        var existImg = genCell.querySelector('img');
+        if (existImg) { existImg.src = genPathNew; }
+        else { var sh = genCell.querySelector('.sec-shimmer'); if (sh) sh.outerHTML = '<img src="' + esc(genPathNew) + '" />'; }
+      }
+      var dot = genCell.querySelector('.fc-score-dot'); if (dot) dot.style.background = clr;
+      var vd = genCell.querySelector('.fc-verdict'); if (vd) { vd.textContent = verdict; vd.style.color = clr; }
+      var sv = genCell.querySelector('.fc-score-val'); if (sv) { sv.textContent = score.toFixed(2); sv.style.color = clr; }
+      genCell.classList.remove('flashing');
+      void genCell.offsetWidth;
+      genCell.classList.add('flashing');
+      setTimeout(function() { genCell.classList.remove('flashing'); }, 500);
     }
+  }
+
+  // On assemble:complete: stagger lock gen cells with colored top-border accent
+  if (phase === 'assemble:complete') {
+    var slugs = state.sectionOrder.slice();
+    setReadyAfter(slugs.length * 80 + 600);
+    slugs.forEach(function(slug, idx) {
+      setTimeout(function() {
+        var genCell = document.getElementById('sxag-' + slug);
+        if (!genCell || genCell.classList.contains('locked')) return;
+        genCell.classList.add('locked');
+        gsap.fromTo(genCell, { opacity: 0.55 }, { opacity: 1, duration: 0.3, ease: 'power2.out' });
+      }, idx * 80);
+    });
   }
 }
 
@@ -322,6 +409,20 @@ var currentSlide = -1;function animateSlide0Entry() {
   // Approximate readable chars: full URL + ~1/3 of snippet (rest is clipped)
   var readingMs = Math.max(2500, Math.min(10000, (urlLen + htmlLen / 3) * 8));
   setReadyAfter(animFinishMs + readingMs);
+}function animateSlide4Entry() {
+  var twoUp = document.querySelector('#slide-4 .two-up');
+  if (!twoUp) return;
+  var left = twoUp.children[0], right = twoUp.children[1];
+  var scoreRow = document.getElementById('fi-score-row');
+  var barRow = document.querySelector('#slide-4 .bar-track');
+  var stats = document.getElementById('fi-stats');
+  var carouselDur = 0.45, step = 0.2, dur = 0.4;
+  [left, right, scoreRow, barRow, stats].forEach(function(el) { if (el) gsap.set(el, { opacity: 0, y: 12 }); });
+  if (left) gsap.to(left, { opacity: 1, y: 0, duration: dur, delay: carouselDur, ease: 'power2.out', clearProps: 'transform' });
+  if (right) gsap.to(right, { opacity: 1, y: 0, duration: dur, delay: carouselDur + step, ease: 'power2.out', clearProps: 'transform' });
+  var statsDelay = carouselDur + step * 2;
+  [scoreRow, barRow, stats].forEach(function(el) { if (el) gsap.to(el, { opacity: 1, y: 0, duration: dur, delay: statsDelay, ease: 'power2.out', clearProps: 'transform' }); });
+  setReadyAfter((statsDelay + dur + 1.5) * 1000);
 }function startPan(img) {
   var wrap = img.parentElement;
   if (!wrap || !wrap.classList.contains('img-pan-wrap')) return;
@@ -349,6 +450,16 @@ function jumpToSlide(idx) {
       if (idx === 0) {
         _newSlideEntryDelay = 0;
         animateSlide0Entry();
+        return;
+      }
+      // Slide 3 & 4 manage their own entrance animations
+      if (idx === 3) {
+        _newSlideEntryDelay = 0;
+        return;
+      }
+      if (idx === 4) {
+        _newSlideEntryDelay = 0;
+        if (RUN_META.hasFidelity && idx === SLIDE_COUNT - 1) animateSlide4Entry();
         return;
       }
       var blocks = Array.from(slideEl.querySelectorAll('.card, .track-row'));
@@ -379,7 +490,6 @@ function renderStep(idx) {
   renderSlide1(state);
   renderSlide2(state);
   renderSlide3(state, ev);
-  renderSlide4(state);
   if (RUN_META.hasFidelity) renderSlide5(state);
 
   // Header section count
@@ -400,6 +510,7 @@ var stepIdx = 0, playing = false, loop = false, dwellMs = 1000, timerId = null;
 var animateUntil = 0;
 var _newSlideEntryDelay = 0;
 var manualMode = true;
+var _slide3EntryPending = false;
 function setReadyAfter(ms) { animateUntil = Math.max(animateUntil, Date.now() + ms); }
 
 function manualGoToSlide(slideIdx) {
@@ -422,6 +533,23 @@ function manualGoToSlide(slideIdx) {
     document.querySelectorAll('.bbox').forEach(function(el) {
       gsap.set(el, { opacity: 0 });
     });
+  }
+  if (slideIdx === 3) {
+    // Hide all rows and reset gen cells — scan will fade each row in as a pair
+    document.querySelectorAll('.sxa-row').forEach(function(el) {
+      gsap.set(el, { opacity: 0, y: 6 });
+    });
+    document.querySelectorAll('.sxa-row-gen').forEach(function(cell) {
+      cell.classList.remove('locked', 'flashing', 'scanning');
+      cell.style.removeProperty('--fc-border');
+      var img = cell.querySelector('img');
+      if (img) img.outerHTML = '<div class="sec-shimmer shimmer"></div>';
+      var dot = cell.querySelector('.fc-score-dot'); if (dot) dot.style.background = '';
+      var vd = cell.querySelector('.fc-verdict'); if (vd) vd.textContent = '';
+      var sv = cell.querySelector('.fc-score-val'); if (sv) sv.textContent = '';
+      var badge = cell.querySelector('.iter-badge'); if (badge) { badge.style.display = 'none'; badge.textContent = ''; }
+    });
+    _slide3EntryPending = true;
   }
   // Force jumpToSlide to see a slide change and trigger pop-in
   currentSlide = -1;

@@ -20,10 +20,10 @@ function phaseToSlide(phase) {
   if (phase === 'section:start' || phase === 'section:complete') return 3;
   if (phase === 'correction-iter:start' || phase === 'correction-iter:complete') return 3;
   if (phase === 'section-score' || phase === 'section-correction:start' || phase === 'section-correction:complete') return 3;
-  if (phase === 'assemble:start' || phase === 'assemble:complete') return 4;
-  if (phase === 'baseline:start' || phase === 'baseline:complete') return 4;
-  if (phase === 'run:complete') return RUN_META.hasFidelity ? SLIDE_COUNT - 1 : 4;
-  if (phase === 'fidelity:start' || phase === 'fidelity:complete') return RUN_META.hasFidelity ? SLIDE_COUNT - 1 : 4;
+  if (phase === 'assemble:start' || phase === 'assemble:complete') return 3;
+  if (phase === 'baseline:start' || phase === 'baseline:complete') return 3;
+  if (phase === 'run:complete') return RUN_META.hasFidelity ? SLIDE_COUNT - 1 : 3;
+  if (phase === 'fidelity:start' || phase === 'fidelity:complete') return RUN_META.hasFidelity ? SLIDE_COUNT - 1 : 3;
   return 0;
 }
 
@@ -52,7 +52,7 @@ function deriveState(upTo) {
     else if (p === 'skeleton:complete') { s.skeleton.status = 'complete'; s.skeleton.data = d; }
     else if (p === 'section:start') {
       if (s.sectionOrder.indexOf(d.slug) < 0) s.sectionOrder.push(d.slug);
-      s.sections[d.slug] = { status: 'active', role: d.role, order: d.order, score: null, verdict: null, fixing: false, durationMs: null };
+      s.sections[d.slug] = { status: 'active', role: d.role, order: d.order, score: null, verdict: null, genPath: null, fixing: false, durationMs: null };
     }
     else if (p === 'section:complete') {
       if (s.sections[d.slug]) { s.sections[d.slug].status = 'complete'; s.sections[d.slug].durationMs = d.durationMs; }
@@ -67,7 +67,7 @@ function deriveState(upTo) {
       for (k = s.corrections.length - 1; k >= 0; k--) {
         if (s.corrections[k].iter === d.iteration) { s.corrections[k].scores[d.slug] = { score: d.score, verdict: d.verdict, issues: d.issues, genPath: d.generatedScreenshotPath, srcPath: d.sourceScreenshotPath }; break; }
       }
-      if (s.sections[d.slug]) { s.sections[d.slug].score = d.score; s.sections[d.slug].verdict = d.verdict; }
+      if (s.sections[d.slug]) { s.sections[d.slug].score = d.score; s.sections[d.slug].verdict = d.verdict; if (d.generatedScreenshotPath) s.sections[d.slug].genPath = d.generatedScreenshotPath; }
     }
     else if (p === 'section-correction:start') {
       for (k = s.corrections.length - 1; k >= 0; k--) {
@@ -176,11 +176,10 @@ var sp = RUN_META.screenshotPaths;
   });
 })();
 
-// Slide 3 init — build track rows for all sections seen across events
+// Slide 3 init — build rows: ref | gen
 (function() {
   var ppEv = EVENTS.find(function(e){ return e.phase === 'preprocess:complete'; });
   var sections = (ppEv && ppEv.data.sections) ? ppEv.data.sections : [];
-  // Fall back to deriving order from section:start events
   if (sections.length === 0) {
     EVENTS.forEach(function(e) {
       if (e.phase === 'section:start') {
@@ -191,21 +190,29 @@ var sp = RUN_META.screenshotPaths;
     });
     sections.sort(function(a,b){ return a.order - b.order; });
   }
-  var container = document.getElementById('tracks');
+  var rowsContainer = document.getElementById('sxa-rows');
   sections.forEach(function(sec) {
+    var thumbSrc = sp && sp.sections && sp.sections[sec.slug] ? sp.sections[sec.slug] : null;
+    var lbl = esc(sec.slug.replace('section-', '\u00a7')) + (sec.role ? ' \u00b7 ' + esc(sec.role) : '');
+    var scoreBarHtml = '<div class="fc-score-bar"><span class="fc-score-dot"></span><span class="fc-verdict"></span><span class="fc-score-val"></span></div>';
+
     var row = document.createElement('div');
-    row.className = 'track-row'; row.id = 'track-' + sec.slug; row.setAttribute('data-status','idle');
+    row.className = 'sxa-row'; row.id = 'sxar-' + sec.slug;
+    row.style.opacity = '0';
     row.innerHTML =
-      '<div class="track-header">' +
-        '<span class="track-num">' + esc(sec.slug.replace('section-','\u00a7')) + '</span>' +
-        '<span class="track-role">' + esc(sec.role) + '</span>' +
-        '<span class="track-desc">' + esc(sec.description || '') + '</span>' +
-        '<span class="track-score-badge" id="tsb-' + sec.slug + '" style="display:none"></span>' +
+      // Reference cell
+      '<div class="sxa-row-ref" id="ref-card-' + sec.slug + '">' +
+        (thumbSrc ? '<img src="' + esc(thumbSrc) + '" />' : '<div class="sec-shimmer shimmer"></div>') +
+        '<div class="sec-lbl">' + lbl + '</div>' +
       '</div>' +
-      '<div class="track-timeline" id="tl-' + sec.slug + '">' +
-        '<div class="tl-pending">\u25cb</div>' +
+      // Gen cell
+      '<div class="sxa-row-gen" id="sxag-' + sec.slug + '">' +
+        '<div class="sec-shimmer shimmer"></div>' +
+        '<div class="iter-badge" style="display:none"></div>' +
+        scoreBarHtml +
+        '<div class="sec-lbl">' + lbl + '</div>' +
       '</div>';
-    container.appendChild(row);
+    rowsContainer.appendChild(row);
   });
 })();`;
 }
