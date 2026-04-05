@@ -80,13 +80,8 @@ export function buildHtmlShell(p: HtmlShellParams): string {
       <div class="skel-left card">
         <div class="card-lbl">Skeleton Preview</div>
         <div id="skel-ph" class="shimmer skel-placeholder"></div>
-        <div class="img-pan-wrap" id="skel-pan-wrap" style="display:none;margin-bottom:0.75rem">
+        <div class="img-pan-wrap" id="skel-pan-wrap" style="display:none">
           <img id="skel-img" src="" />
-        </div>
-        <div class="skel-stats" id="skel-stats" style="display:none">
-          <div class="stat-tile"><div class="lbl">Model</div><div class="val" id="skel-model" style="font-size:0.7rem;margin-top:0.15rem">—</div></div>
-          <div class="stat-tile"><div class="val" id="skel-tokens">—</div><div class="lbl">Tokens</div></div>
-          <div class="stat-tile"><div class="val" id="skel-dur">—</div><div class="lbl">Duration</div></div>
         </div>
       </div>
       <div class="skel-right card" id="skel-html-card" style="display:none">
@@ -135,11 +130,11 @@ export function buildHtmlShell(p: HtmlShellParams): string {
         <div class="two-up" style="margin-bottom:0.85rem">
           <div>
             <div class="two-up-lbl">Source</div>
-            <div class="img-pan-wrap"><img id="fi-src" src="" style="display:none" /></div>
+            <div class="img-pan-wrap"><img id="fi-src" class="ss" src="" style="display:none" /></div>
           </div>
           <div>
             <div class="two-up-lbl">Generated</div>
-            <div class="img-pan-wrap"><img id="fi-img" src="" style="display:none" /></div>
+            <div class="img-pan-wrap"><img id="fi-img" class="ss" src="" style="display:none" /></div>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:0.8rem;margin-bottom:0.5rem">

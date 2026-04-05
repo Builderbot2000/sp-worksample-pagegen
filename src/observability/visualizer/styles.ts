@@ -66,7 +66,8 @@ export const vizStyles = `
 
     /* ── Slide 2: Skeleton ── */
     #slide-2{justify-content:center;align-items:stretch}
-    .skel-left{flex:0 0 42%;max-width:540px;min-width:0}
+    .skel-left{flex:0 0 42%;max-width:540px;min-width:0;display:flex;flex-direction:column;overflow:hidden}
+    #skel-pan-wrap{flex:1;max-height:none !important}
     .skel-right{flex:1;min-width:0;max-width:520px;display:flex;flex-direction:column}
     .skel-html-code{flex:1;overflow-y:auto;font-family:monospace;font-size:0.6rem;color:#9ca3af;white-space:pre-wrap;word-break:break-all;background:#0d1117;border:1px solid #21262d;border-radius:5px;padding:0.6rem;min-height:0;margin:0}
     .shimmer{background:linear-gradient(90deg,#161b22 25%,#21262d 50%,#161b22 75%);background-size:200% 100%;animation:shimmer 1.5s infinite}
@@ -116,6 +117,11 @@ export const vizStyles = `
 
     /* ── Slide 5: End ── */
     .fi-wrap{max-width:800px;width:100%;margin:0 auto}
+    #slide-5{overflow:hidden;align-items:stretch}
+    #slide-5 .fi-wrap{display:flex;flex-direction:column}
+    #slide-5 .two-up{flex:1;min-height:0}
+    #slide-5 .two-up>div{display:flex;flex-direction:column;min-height:0}
+    #slide-5 .img-pan-wrap{flex:1;max-height:none;min-height:0}
 
     /* ── Entrance animation (used by GSAP) ── */
 

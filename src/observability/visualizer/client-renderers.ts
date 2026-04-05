@@ -47,7 +47,7 @@ function renderSlide1(state) {
   });
   if (newPairs.length > 0) {
     if (currentSlide === 1) {
-      var pairStagger = 0.6;
+      var pairStagger = 1.2;
       var lastStart = entryDelay + (newPairs.length > 1 ? (newPairs.length - 1) * pairStagger : 0);
       setReadyAfter((lastStart + 0.35 + 2.0) * 1000);
       newPairs.forEach(function(pair, i) {
@@ -79,10 +79,12 @@ function renderSlide1(state) {
       sections.forEach(function(sec) {
         var card = document.getElementById('seccard-' + sec.slug);
         if (!card) return;
-        var idealTop = (sec.y / pageH) * wrapH;
+        var bboxCenterY = ((sec.y + sec.heightPx / 2) / pageH) * wrapH;
+        var cardH = card.offsetHeight || 80;
+        var idealTop = bboxCenterY - cardH / 2;
         var top = Math.max(idealTop, minTop);
         card.style.top = top + 'px';
-        minTop = top + (card.offsetHeight || 80) + 8;
+        minTop = top + cardH + 8;
       });
     }
   }
@@ -95,7 +97,6 @@ function renderSlide2(state) {
     document.getElementById('skel-ph').style.display = '';
     var panWrap = document.getElementById('skel-pan-wrap');
     if (panWrap) panWrap.style.display = 'none';
-    document.getElementById('skel-stats').style.display = 'none';
     return;
   }
   // complete
@@ -120,7 +121,6 @@ function renderSlide2(state) {
       setReadyAfter(4000); // hold until image loads; startPan will extend precisely
       skImg.src = d.screenshotPath;
       skImg.onload = function() {
-        startPan(skImg);
         // Slide HTML panel in after screenshot is showing
         var hc = document.getElementById('skel-html-card');
         if (hc) gsap.to(hc, { opacity: 1, x: 0, duration: 0.55, delay: 0.5, ease: 'power2.out', clearProps: 'transform' });
@@ -129,12 +129,6 @@ function renderSlide2(state) {
   } else {
     // No screenshot — show HTML panel immediately
     if (htmlCard) gsap.to(htmlCard, { opacity: 1, x: 0, duration: 0.55, ease: 'power2.out', clearProps: 'transform' });
-  }
-  document.getElementById('skel-stats').style.display = '';
-  if (d) {
-    document.getElementById('skel-model').textContent = d.model || '\u2014';
-    document.getElementById('skel-tokens').textContent = fmtNum(d.tokensIn) + ' / ' + fmtNum(d.tokensOut);
-    document.getElementById('skel-dur').textContent = fmtMs(d.durationMs);
   }
 }
 
@@ -292,14 +286,12 @@ function renderSlide5(state) {
     var srcImg = document.getElementById('fi-src');
     if (srcImg && !srcImg.getAttribute('src')) {
       srcImg.src = sp.source; srcImg.style.display = '';
-      srcImg.onload = function() { startPan(srcImg); };
     }
   }
   if (sp && sp.fidelityMain) {
     var genImg = document.getElementById('fi-img');
     if (genImg && !genImg.getAttribute('src')) {
       genImg.src = sp.fidelityMain; genImg.style.display = '';
-      genImg.onload = function() { startPan(genImg); };
     }
   }
 }
