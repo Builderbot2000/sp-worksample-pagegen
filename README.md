@@ -171,7 +171,7 @@ npm run test:correction-loop -- https://stripe.com/en-ca/payments --name stripe-
 
 ### Report regeneration
 
-Regenerates `report.html` for any completed run without re-running the pipeline. Reads `run.json` and the on-disk screenshots saved during the original run.
+Regenerates `report.html` and `visualizer.html` for any completed run without re-running the pipeline. Reads `run.json`, the on-disk screenshots, and the `run.ndjson` event stream saved during the original run.
 
 ```sh
 npm run report -- <run-directory>
@@ -181,6 +181,19 @@ npm run report -- <run-directory>
 # Example
 npm run report -- output/1775259398171-stripe-correction-test
 ```
+
+Both `report.html` (static metrics summary) and `visualizer.html` (step-by-step pipeline animation) are written to the run directory.
+
+### Pipeline visualizer
+
+`visualizer.html` is produced automatically alongside `report.html` on every run and every `npm run report` invocation. Open it in a browser to replay the full pipeline event-by-event:
+
+- **Stage lanes** show each phase (Preprocess, Skeleton, Sections, Assembly, Correction iterations, Fidelity) transitioning idle → active → complete as events arrive
+- **Section chips** pop in on generation start and update with VLM scores as scoring events arrive
+- **Artifact panel** shows the relevant screenshot, stats, or comparison for the current event — source vs generated side-by-side for score events, fidelity screenshot on completion, and full summary on run complete
+- **Playback controls** — play/pause, step forward/back, scrubber, speed (0.5×/1×/2×/4×), loop
+
+Images are loaded from relative paths in the run directory, so open the file directly from its output folder.
 
 ## The Challenge
 

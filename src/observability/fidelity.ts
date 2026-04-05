@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { resizeForVlm } from "../image";
 import { MODELS } from "../config";
+import { screenshotHtmlFile } from "./screenshot";
 import type {
   VlmFidelityScore,
   VlmVerdict,
@@ -288,32 +289,6 @@ export function scoreSeverity(score: number): "high" | "medium" | "low" {
   return "high";
 }
 
-// ─── Full-page screenshot helper ──────────────────────────────────────────────
-
-async function screenshotFile(filePath: string): Promise<Buffer> {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  });
-  try {
-    const page = await browser.newPage();
-    await page.setViewport(VIEWPORT);
-    await page.goto(`file://${path.resolve(filePath)}`, {
-      waitUntil: "networkidle2",
-      timeout: 30_000,
-    });
-    const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
-    const captureHeight = Math.min(scrollHeight, MAX_SCREENSHOT_HEIGHT);
-    const buf = await page.screenshot({
-      type: "png",
-      clip: { x: 0, y: 0, width: VIEWPORT.width, height: captureHeight },
-    });
-    return Buffer.from(buf);
-  } finally {
-    await browser.close();
-  }
-}
-
 // ─── Collect final fidelity metrics ──────────────────────────────────────────
 
 export async function collectFidelityMetrics(
@@ -331,7 +306,7 @@ export async function collectFidelityMetrics(
 
   const [mainSections, mainScreenshotBuf] = await Promise.all([
     screenshotSectionsBySlug({ file: mainFilePath }, archDoc),
-    screenshotFile(mainFilePath),
+    screenshotHtmlFile(mainFilePath),
   ]);
 
   const mainSectionPaths: Record<string, string> = {};
@@ -360,7 +335,7 @@ export async function collectFidelityMetrics(
   };
 
   if (baselineFilePath) {
-    const baselineScreenshotBuf = await screenshotFile(baselineFilePath);
+    const baselineScreenshotBuf = await screenshotHtmlFile(baselineFilePath);
     metrics.baselineScreenshotBase64 = baselineScreenshotBuf.toString("base64");
   }
 

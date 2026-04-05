@@ -75,13 +75,17 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
       captionTokensIn: crawlResult.captionTokensIn,
       captionTokensOut: crawlResult.captionTokensOut,
       durationMs: Date.now() - preprocessStart,
+      sections: archDoc.sections,
+      viewportWidth: 1280,
+      pageHeight: crawlResult.scrollHeight,
+      htmlSnippet: crawlResult.html.slice(0, 8000),
     },
   });
 
   // ── Phase 0: Save source screenshots unconditionally ─────────────────────────
   const sectionsDir = path.join(runDir, "sections");
   fs.mkdirSync(sectionsDir, { recursive: true });
-  fs.writeFileSync(path.join(runDir, "source.png"), Buffer.from(crawlResult.screenshotBase64, "base64"));
+  fs.writeFileSync(path.join(runDir, "source.png"), Buffer.from(crawlResult.fullPageScreenshotBase64, "base64"));
   for (const section of archDoc.sections) {
     const bufs = crawlResult.sourceSectionScreenshots[section.slug];
     if (bufs?.[0]) fs.writeFileSync(path.join(sectionsDir, `source-${section.slug}.png`), bufs[0]);
@@ -120,10 +124,32 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     return null;
   }
   const { skeletonHtml, skeletonBasename, tokensIn: skeletonIn, tokensOut: skeletonOut } = skeletonResult;
+
+  // Take a screenshot of the skeleton HTML for the visualizer (best-effort)
+  let skeletonScreenshotPath: string | undefined;
+  try {
+    const puppeteer = await import("puppeteer");
+    const skeletonAbsPath = path.join(mainDir, `${skeletonBasename}-skeleton.html`);
+    const skeletonBrowser = await puppeteer.default.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+    const skeletonPage = await skeletonBrowser.newPage();
+    await skeletonPage.setViewport({ width: 1280, height: 900 });
+    await skeletonPage.goto(`file://${skeletonAbsPath}`, { waitUntil: "networkidle0", timeout: 15000 });
+    const skeletonBuf = await skeletonPage.screenshot({
+      type: "png",
+      fullPage: true,
+    });
+    await skeletonBrowser.close();
+    const skeletonPreviewRelPath = `main/skeleton-preview.png`;
+    fs.writeFileSync(path.join(runDir, skeletonPreviewRelPath), Buffer.from(skeletonBuf));
+    skeletonScreenshotPath = skeletonPreviewRelPath;
+  } catch {
+    // screenshot is best-effort; never block the pipeline
+  }
+
   logger.log({
     phase: "skeleton:complete",
     timestamp: Date.now(),
-    data: { model: MODELS.skeleton, tokensIn: skeletonIn, tokensOut: skeletonOut, durationMs: Date.now() - skeletonStart, outputFile: `main/${skeletonBasename}-skeleton.html` },
+    data: { model: MODELS.skeleton, tokensIn: skeletonIn, tokensOut: skeletonOut, durationMs: Date.now() - skeletonStart, outputFile: `main/${skeletonBasename}-skeleton.html`, screenshotPath: skeletonScreenshotPath },
   });
   console.log(`[gen] Skeleton done — ${skeletonIn} in / ${skeletonOut} out tokens`);
 
@@ -243,7 +269,7 @@ export async function generatePage(url: string, opts: GenerateOptions = {}): Pro
     try {
       const fidelityDir = path.join(runDir, "fidelity");
       const { metrics: fidelity, tokensIn: fidelityIn, tokensOut: fidelityOut, mainSectionPaths } = await collectFidelityMetrics(
-        { screenshotBase64: crawlResult.screenshotBase64, sectionScreenshots: crawlResult.sourceSectionScreenshots },
+        { screenshotBase64: crawlResult.fullPageScreenshotBase64, sectionScreenshots: crawlResult.sourceSectionScreenshots },
         archDoc,
         savedPath,
         baselineSavedPath ?? undefined,

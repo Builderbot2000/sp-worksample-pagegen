@@ -2,34 +2,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { escHtml as escapeHtml } from "../utils";
 import type { RunRecord, IterationRecord, Severity, FidelityMetrics } from "./types";
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  const m = Math.floor(ms / 60_000);
-  const s = Math.floor((ms % 60_000) / 1000);
-  return `${m}m ${s}s`;
-}
-
-function formatDate(ts: number): string {
-  return new Date(ts).toISOString().replace("T", " ").slice(0, 19) + " UTC";
-}
-
-function severityColor(severity: Severity): string {
-  if (severity === "high") return "#ef4444";
-  if (severity === "medium") return "#f59e0b";
-  return "#22c55e";
-}
-
-function scoreBarWidth(score: number): number {
-  return Math.round(Math.max(0, Math.min(1, score)) * 100);
-}
-
-function scoreColor(score: number): string {
-  if (score > 0.85) return "#22c55e";
-  if (score >= 0.6) return "#f59e0b";
-  return "#ef4444";
-}
+import { formatDuration, formatDate, severityColor, scoreBarWidth, scoreColor } from "./report-utils";
+import { parseEventStream, generateVisualizer } from "./visualizer";
 
 // ─── Section builders ─────────────────────────────────────────────────────────
 
@@ -210,8 +184,6 @@ function buildComparisonSection(
 
 function buildFidelitySection(fidelity: FidelityMetrics): string {
   const imgStyle = "width:100%;border-radius:4px;display:block";
-  const scoreColor = (s: number) =>
-    s > 0.85 ? "#22c55e" : s >= 0.6 ? "#f59e0b" : "#ef4444";
 
   const verdictColor = (v: string) =>
     v === "close" ? "#22c55e" : v === "partial" ? "#f59e0b" : "#ef4444";
@@ -311,8 +283,9 @@ export function hydrateScreenshots(
   const paths = record.screenshotPaths;
 
   const tryRead = (rel: string | undefined): string | undefined => {
-    const abs = path.join(runDir, rel as string);
-    return fs.existsSync(abs) ? fs.readFileSync(abs).toString('base64') : undefined;
+    if (!rel) return undefined;
+    const abs = path.join(runDir, rel);
+    return fs.existsSync(abs) ? fs.readFileSync(abs).toString("base64") : undefined;
   };
 
   const sourceb64 = tryRead(paths?.source);
@@ -464,5 +437,13 @@ export function generateReport(
   const outPath = path.join(runDir, "report.html");
   fs.writeFileSync(outPath, html, "utf-8");
   process.stdout.write(`Report: ${outPath}\n`);
+
+  try {
+    const vizEvents = parseEventStream(runDir);
+    generateVisualizer(runDir, vizEvents, record);
+  } catch {
+    // Visualizer generation is best-effort; never fail the main report
+  }
+
   return outPath;
 }

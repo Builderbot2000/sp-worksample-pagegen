@@ -11,7 +11,8 @@
     "test:skeleton": "tsx scripts/test-skeleton.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "wiki": "npx docsify-cli serve wiki"
   },
   "private": true,
   "type": "commonjs",

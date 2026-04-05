@@ -28,7 +28,10 @@ export interface ComputedStyleEntry {
 export interface CrawlResult {
   html: string;
   truncated: boolean;
+  /** Viewport-only screenshot — used for operational VLM calls (skeleton agent, etc.). */
   screenshotBase64: string;
+  /** Full-page screenshot — used for report/visualizer artifacts only. */
+  fullPageScreenshotBase64: string;
   scrollHeight: number;
   computedStyles: ComputedStyleEntry[];
   imageUrls: string[];
@@ -57,12 +60,16 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
 
     // ── Full-page screenshot ─────────────────────────────────────────────────
     const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
-    const captureHeight = Math.min(scrollHeight, MAX_SCREENSHOT_HEIGHT);
     const screenshotBuf = await page.screenshot({
       type: "png",
-      clip: { x: 0, y: 0, width: VIEWPORT.width, height: captureHeight },
     });
     const screenshotBase64 = Buffer.from(screenshotBuf).toString("base64");
+
+    const fullPageScreenshotBuf = await page.screenshot({
+      type: "png",
+      fullPage: true,
+    });
+    const fullPageScreenshotBase64 = Buffer.from(fullPageScreenshotBuf).toString("base64");
 
     // ── HTML ─────────────────────────────────────────────────────────────────
     const rawHtml = await page.content();
@@ -348,6 +355,7 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
       description: captionMap.get(s.slug) ?? s.description,
       role: s.role,
       order: i + 1,
+      y: s.y,
       heightPx: s.height,
     }));
 
@@ -355,6 +363,7 @@ export async function crawlAndPreprocess(url: string): Promise<CrawlResult> {
       html,
       truncated,
       screenshotBase64,
+      fullPageScreenshotBase64,
       scrollHeight,
       computedStyles: extracted.computedStyles,
       imageUrls: extracted.uniqueImageUrls,

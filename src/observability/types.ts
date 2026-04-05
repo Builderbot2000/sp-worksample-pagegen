@@ -18,6 +18,8 @@ export interface SectionSpec {
   description: string;
   role: string;
   order: number;
+  /** Pixel y offset of the section in the source page at the crawl viewport. */
+  y: number;
   /** Pixel height of the section in the source page at the crawl viewport. */
   heightPx: number;
 }
@@ -80,6 +82,14 @@ export interface PreprocessCompleteData {
   captionTokensIn: number;
   captionTokensOut: number;
   durationMs: number;
+  /** Full section specs including y/heightPx for bounding box overlay. */
+  sections?: SectionSpec[];
+  /** Crawl viewport width in pixels. */
+  viewportWidth?: number;
+  /** Full page scroll height in pixels (for correct bbox ↔ screenshot alignment). */
+  pageHeight?: number;
+  /** First chars of source HTML for the Start slide. */
+  htmlSnippet?: string;
 }
 
 export interface SkeletonStartData {
@@ -92,6 +102,8 @@ export interface SkeletonCompleteData {
   tokensOut: number;
   durationMs: number;
   outputFile: string;
+  /** Path to skeleton preview screenshot relative to run dir, if available. */
+  screenshotPath?: string;
 }
 
 export interface SectionStartData {
