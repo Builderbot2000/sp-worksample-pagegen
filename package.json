@@ -12,7 +12,8 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "check": "tsc --noEmit",
-    "wiki": "npx docsify-cli serve wiki"
+    "wiki": "npx docsify-cli serve wiki",
+    "viz:mc": "tsx scripts/viz-mc.ts"
   },
   "private": true,
   "type": "commonjs",

@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "lib": ["ESNext", "DOM"],
+    "moduleResolution": "bundler",
+    "strict": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@motion-canvas/2d/lib",
+    "skipLibCheck": true,
+    "types": ["vite/client"],
+    "resolveJsonModule": true
+  },
+  "include": ["src"]
+}

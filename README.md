@@ -195,6 +195,29 @@ Both `report.html` (static metrics summary) and `visualizer.html` (step-by-step 
 
 Images are loaded from relative paths in the run directory, so open the file directly from its output folder.
 
+### Motion Canvas visualizer
+
+An animated step-by-step visualizer built with Motion Canvas. Unlike `visualizer.html`, this one renders as a proper animation with synchronized panning screenshots, staggered reveals, and a score count-up — viewable in the Motion Canvas editor or exported as video.
+
+```sh
+npm run viz:mc -- <run-directory>
+```
+
+```sh
+# Example
+npm run viz:mc -- output/1775350622628-stripe-en-ca-payments-reference
+```
+
+This writes the run data into the MC sub-project and starts the Vite dev server at `http://localhost:9000`. Open that URL in a browser to play back the animation in the Motion Canvas editor.
+
+The visualizer has five scenes that play in order:
+
+1. **Start** — source screenshot pan, run URL, config chips, source HTML snippet
+2. **Preprocess** — annotated screenshot with section bounding boxes and per-section cards
+3. **Skeleton** — skeleton screenshot pan alongside the generated HTML structure
+4. **Sections & Assembly** — section-by-section generation with score bars and correction passes
+5. **End** — source vs generated side-by-side with animated fidelity score (only shown when `--correction` was used)
+
 ## The Challenge
 
 Improve the **fidelity** of generated pages. The output should closely match the source page across four dimensions:
